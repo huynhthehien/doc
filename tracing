@@ -1,0 +1,4818 @@
+/*************************************************************************/ /*!
+@File           bufobj.c
+@Title          Entrypoints and implementation of buffer objects
+@Copyright      Copyright (c) Imagination Technologies Ltd. All Rights Reserved
+@Description    Entrypoints and implementation of buffer objects
+@License        Strictly Confidential.
+*/ /**************************************************************************/
+
+#include "context.h"
+#include "tqmanager.h"
+#include "ri_typedefs.h"
+#include "pvrsrv_cache.h"
+#include <string.h>
+#include <log2.h>
+#include "imgextensions.h"
+#include "hwperf_client_utils.h"
+
+#define GLES3_MAP_BUFOBJ_USE_BACKUP				0x00000001
+#define GLES3_MAP_BUFOBJ_COPY_BACKUP			0x00000002
+#define GLES3_MAP_BUFOBJ_FLUSH_BY_CLIENT		0x00000004
+#define GLES3_MAP_BUFOBJ_FLUSH_BY_UNMAP			0x00000008
+#define GLES3_MAP_BUFOBJ_FLUSHED_BY_CLIENT		0x00000010
+#define GLES3_MAP_BUFOBJ_BACKUP_USED_IN_TQ      0x00000020
+#define GLES3_MAP_BUFOBJ_BACKUP_AUTO_RECYCLED   0x00000040 /* Freed by TQM */
+
+
+#define FlushCachedDevmem(psMemInfo, uAccessFlags)							if((uAccessFlags) & gc->ui32DevmemCacheFlushOn) FlushCachedDevmemRangeInt(gc, psMemInfo, 0, psMemInfo->uiAllocationSize)
+#define FlushCachedDevmemRange(psMemInfo, uiOffset, uiSize, uAccessFlags)	if((uAccessFlags) & gc->ui32DevmemCacheFlushOn) FlushCachedDevmemRangeInt(gc, psMemInfo, uiOffset, uiSize)
+
+static void FlushCachedDevmemRangeInt(GLES3Context *gc, PVRSRV_MEMINFO *psMemInfo, IMG_DEVMEM_OFFSET_T uiOffset, IMG_DEVMEM_SIZE_T uiSize)
+{
+	PVRSRV_CACHE_OP eOp = PVRSRV_CACHE_OP_FLUSH;
+	PVRSRVCacheOpExec(gc->psSysContext->psDevConnection,
+					  &psMemInfo->hMemDesc,
+					  NULL,
+					  &uiOffset,
+					  &uiSize,
+					  &eOp,
+					  1,
+					  PVRSRV_NO_TIMELINE);
+}
+
+
+
+/***********************************************************************************
+ Function Name      : GetBufferIndexFromTarget
+ Inputs             : target
+ Outputs            : -
+ Returns            : buffer object target index
+ Description        : Convert the buffer object target type from GLenum to internal
+                      defined integer values.
+************************************************************************************/
+IMG_INTERNAL IMG_INT32 GetBufferIndexFromTarget(GLenum target)
+{
+	/* Add here if more target is support */
+	switch (target)
+	{
+		case GL_TRANSFORM_FEEDBACK_BUFFER:		return TRANSFORM_FEEDBACK_BUFFER_INDEX;
+		case GL_UNIFORM_BUFFER:					return UNIFORM_BUFFER_INDEX;
+		case GL_ARRAY_BUFFER:					return ARRAY_BUFFER_INDEX;
+		case GL_ELEMENT_ARRAY_BUFFER:			return ELEMENT_ARRAY_BUFFER_INDEX;
+		case GL_PIXEL_PACK_BUFFER:				return PIXEL_PACK_BUFFER_INDEX;
+		case GL_PIXEL_UNPACK_BUFFER:			return PIXEL_UNPACK_BUFFER_INDEX;
+		case GL_COPY_READ_BUFFER:				return COPY_READ_BUFFER_INDEX;
+		case GL_COPY_WRITE_BUFFER:				return COPY_WRITE_BUFFER_INDEX;
+		case GL_SHADER_STORAGE_BUFFER:			return SHADER_STORAGE_BUFFER_INDEX;
+		case GL_DISPATCH_INDIRECT_BUFFER:		return DISPATCH_INDIRECT_BUFFER_INDEX;
+		case GL_ATOMIC_COUNTER_BUFFER:			return ATOMIC_COUNTER_BUFFER_INDEX;
+		case GL_DRAW_INDIRECT_BUFFER:			return DRAW_INDIRECT_BUFFER_INDEX;
+#if defined(GLES3_EXTENSION_TEXTURE_BUFFER)
+		case GL_TEXTURE_BUFFER_EXT:				return TEXTURE_BUFFER_INDEX;
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_BUILD_BUFFER_OBJECT)
+		case GL_COMPONENT_BUILD_BUFFER_IMG:		return COMPONENT_BUILD_BUFFER_INDEX;
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_GROUP_MERGE_BUFFER_OBJECT)
+		case GL_COMPONENT_GROUP_MERGE_BUFFER_IMG: return COMPONENT_GROUP_MERGE_BUFFER_INDEX;
+#endif
+	}
+
+	return -1;
+}
+
+/***********************************************************************************
+ Function Name      : IsBoundToContext
+ Inputs             : i32TargetIndex
+ Outputs            :
+ Returns            :
+ Description        : Only used for those buffers which need special
+					  treatment in some places as they are not bound to context, e.g.,
+					  ELEMENT_ARRAY_BUFFER_INDEX.
+************************************************************************************/
+static IMG_BOOL IsBoundToContext(IMG_INT32 i32TargetIndex, IMG_BOOL bIndexedBindingPoint)
+{
+	switch (i32TargetIndex)
+	{
+		case ELEMENT_ARRAY_BUFFER_INDEX:
+		{
+			return IMG_FALSE;
+		}
+		case TRANSFORM_FEEDBACK_BUFFER_INDEX:
+		{
+			return !bIndexedBindingPoint;
+		}
+		default:
+		{
+			return IMG_TRUE;
+		}
+	}
+}
+
+/***********************************************************************************
+ Function Name      : SetupBufferObjectUseMethodFlag
+ Inputs             : gc, psBufferObject, ui32UseMethodFlag,
+                      pvData - if the buffer object is used in TQ, this points to
+					           a IMG_UINT32 which contains the TQ operation position
+							   in TQ queue.
+ Outputs            : -
+ Returns            : -
+ Description        : Set up the use method flag of a buffer object
+************************************************************************************/
+IMG_INTERNAL void SetupBufferObjectUseMethodFlag(GLES3Context *gc, GLES3BufferObject *psBufferObject, IMG_UINT32 ui32UseMethodFlag, IMG_BOOL bRMLocked)
+{
+	/* Clear internal use flags */
+	psBufferObject->ui32UseMethodFlag &= ~(	GLES3_BUFFER_TA_FINISHED | GLES3_BUFFER_TA_GHOSTED |
+											GLES3_BUFFER_3D_FINISHED | GLES3_BUFFER_3D_GHOSTED |
+											GLES3_BUFFER_TQ_FINISHED | GLES3_BUFFER_TQ_GHOSTED |
+											GLES3_BUFFER_CDM_FINISHED);
+
+	if(!ui32UseMethodFlag) return;
+
+	if(!bRMLocked)
+	{
+		RM_Lock(gc->psSysContext->psRM);
+	}
+
+	/* Adjust passed in flags */
+	if ((ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_3D) != 0)
+	{
+		ui32UseMethodFlag |= GLES3_BUFFER_USED_IN_3D;
+		PDUMP_ADDLIVE_BUF(gc, &gc->sFrameBuffer.psActiveDrawFrameBuffer->psPDumpEntriesAfterKick3D, psBufferObject->psMemInfo->hMemDesc, 0, 0, "buf.3d");
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_USED_IN_3D) != 0)
+	{
+		/* Buffer object used in 3D, attach it to 3D resource manager */
+		RM_AttachDependency_NoLock(gc->psSysContext->psRM, gc->psHWQueue_3D, &gc->psRenderSurface->psCurrent3DJob, &psBufferObject->sRMResource,
+				(ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_3D) ? RM_USAGE_WRITE : RM_USAGE_READ);
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_TA) != 0)
+	{
+		ui32UseMethodFlag |= GLES3_BUFFER_USED_IN_TA;
+		PDUMP_ADDLIVE_BUF(gc, &gc->psPDumpEntriesAfterKickTA, psBufferObject->psMemInfo->hMemDesc, 0, 0, "buf.ta");
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_USED_IN_TA) != 0)
+	{
+		RM_AttachDependency_NoLock(gc->psSysContext->psRM, gc->psHWQueue_TA, &gc->psRenderSurface->psCurrentTAJob, &psBufferObject->sRMResource,
+				(ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_TA) ? RM_USAGE_WRITE : RM_USAGE_READ);
+
+
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TQ_FENCE_CHECK) != 0)
+		{
+			IMG_BOOL bNeeded;
+			bNeeded = RM_IsResourceNeededByHWQueue_NoLock(gc->psSysContext->psRM, &psBufferObject->sRMResource, gc->psSysContext->psHWQueue_TQ, RM_USAGE_WRITE);
+
+			/* Fence the TA on the TQ if the TQ is still working on this buffer */
+			if (gc->psRenderSurface && bNeeded)
+			{
+				gc->psRenderSurface->bVertexTexturing = IMG_TRUE;
+				psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_TQ_FENCE_CHECK;
+			}
+        }
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_TQ) != 0)
+	{
+		ui32UseMethodFlag |= (GLES3_BUFFER_USED_IN_TQ | GLES3_BUFFER_TQ_FENCE_CHECK);
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_CDM) != 0)
+	{
+		ui32UseMethodFlag |= GLES3_BUFFER_USED_IN_CDM;
+		PDUMP_ADDLIVE_BUF(gc, &gc->psPDumpEntriesAfterKickCDM, psBufferObject->psMemInfo->hMemDesc, 0, 0, "buf.cdm");
+	}
+
+	if ((ui32UseMethodFlag & GLES3_BUFFER_USED_IN_CDM) != 0)
+	{
+		RM_AttachDependency_NoLock(gc->psSysContext->psRM, gc->psHWQueue_CDM, &gc->psCurrentCDMJob, &psBufferObject->sRMResource,
+				(ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_CDM) ? RM_USAGE_WRITE : RM_USAGE_READ);
+	}
+
+	if(!bRMLocked)
+	{
+		RM_Unlock(gc->psSysContext->psRM);
+	}
+
+	psBufferObject->ui32UseMethodFlag |= ui32UseMethodFlag;
+}
+
+/***********************************************************************************
+ Function Name      : GetGeneralBindingPoint
+ Inputs             : gc, i32TargetIndex
+ Outputs            :
+ Returns            : Pointer to the general buffer binding point
+ Description        : Get the pointer to the general buffer binding point.  Context
+                      bound buffer target has different binding point compared to
+					  non-context bound buffer target, e.g., ELEMENT_ARRAY_BUFFER_INDEX.
+************************************************************************************/
+IMG_INTERNAL GLES3BufferObject ** GetGeneralBindingPoint(GLES3Context *gc, IMG_INT32 i32TargetIndex)
+{
+	if (IsBoundToContext(i32TargetIndex, IMG_FALSE))
+	{
+		return &(gc->sBufferObject.psActiveBuffer[i32TargetIndex]);
+	}
+	else
+	{
+		GLES_ASSERT(i32TargetIndex == ELEMENT_ARRAY_BUFFER_INDEX);
+
+		GLES3VertexArrayObject * psVAO = gc->sVAOMachine.psActiveVAO;
+		GLES_ASSERT(VAO(gc));
+
+		return &(psVAO->psBoundElementBuffer);
+	}
+
+	return NULL;
+}
+
+/***********************************************************************************
+ Function Name      : GetIndexedBufferBindingPoints
+ Inputs             : gc, i32TargetIndex
+ Outputs            : pi32IndexNumber, ppsIndexedBindings
+ Returns            : Success
+ Description        : If the buffer object target is the indexed buffer target,
+                      return the maximum supported number of indices and the start
+					  address of these indexed binding points.
+************************************************************************************/
+IMG_INTERNAL IMG_BOOL GetIndexedBufferBindingPoints(GLES3Context *gc, IMG_INT32 i32TargetIndex,
+													IMG_INT32 * pi32IndexNumber,
+													GLES3BufferObjectIndexedBindingPoint ** ppsIndexedBindings)
+{
+	IMG_BOOL bRet = IMG_TRUE;
+
+	/* Add here if more indexed target is support */
+
+	switch (i32TargetIndex)
+	{
+		case TRANSFORM_FEEDBACK_BUFFER_INDEX:
+		{
+			if (gc->sTFOMachine.psActiveTFObject == NULL)
+			{
+				(*pi32IndexNumber) = 0;
+				(*ppsIndexedBindings) = NULL;
+				return IMG_FALSE;
+			}
+
+			(*pi32IndexNumber) = GLES3_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS;
+			(*ppsIndexedBindings) = gc->sTFOMachine.psActiveTFObject->asTFBufferBindings;
+			break;
+		}
+		case UNIFORM_BUFFER_INDEX:
+		{
+			(*pi32IndexNumber) = GLES3_MAX_UNIFORM_BUFFER_BINDINGS;
+            (*ppsIndexedBindings) = gc->sBufferObject.sBufferObjectIndexedBinding.asUniformBufferBindings;
+			break;
+		}
+		case SHADER_STORAGE_BUFFER_INDEX:
+		{
+			(*pi32IndexNumber) = GLES3_MAX_SHADER_STORAGE_BUFFER_BINDINGS;
+            (*ppsIndexedBindings) = gc->sBufferObject.sBufferObjectIndexedBinding.asShaderStorageBufferBindings;
+			break;
+		}
+		case ATOMIC_COUNTER_BUFFER_INDEX:
+		{
+			(*pi32IndexNumber) = GLES3_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS;
+            (*ppsIndexedBindings) = gc->sBufferObject.sBufferObjectIndexedBinding.asAtomicCountersBufferBindings;
+			break;
+		}
+		default:
+		{
+			bRet = IMG_FALSE;
+		}
+		break;
+	}
+
+	return bRet;
+}
+
+/***********************************************************************************
+ Function Name      : GetDataStoreHWOffsetAndSize
+ Inputs             : i32TargetIndex, size
+ Outputs            : pui32AllocAlign, pui32AllocSize
+ Returns            : Success
+ Description        : This function returns the allocation alignment and allocation size
+					  in the device memory to allocate a buffer data store with specified
+					  size.
+************************************************************************************/
+static IMG_BOOL GetDataStoreHWOffsetAndSize(IMG_INT32 i32TargetIndex, GLsizeiptr size, IMG_DEVMEM_ALIGN_T * puiAllocAlign, IMG_UINT32 * pui32AllocSize)
+{
+	IMG_BOOL bRet =  IMG_TRUE;
+	IMG_DEVMEM_ALIGN_T uiAllocAlign;
+
+	/* Add here if more indexed target is support */
+	switch(i32TargetIndex)
+	{
+		case TRANSFORM_FEEDBACK_BUFFER_INDEX:
+		case UNIFORM_BUFFER_INDEX:
+		case ARRAY_BUFFER_INDEX:
+		case ELEMENT_ARRAY_BUFFER_INDEX:
+		case PIXEL_PACK_BUFFER_INDEX:
+		case PIXEL_UNPACK_BUFFER_INDEX:
+		case COPY_READ_BUFFER_INDEX:
+		case COPY_WRITE_BUFFER_INDEX:
+		case SHADER_STORAGE_BUFFER_INDEX:
+		case DISPATCH_INDIRECT_BUFFER_INDEX:
+		case DRAW_INDIRECT_BUFFER_INDEX:
+		case ATOMIC_COUNTER_BUFFER_INDEX:
+#if defined(GLES3_EXTENSION_TEXTURE_BUFFER)
+		case TEXTURE_BUFFER_INDEX:
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_BUILD_BUFFER_OBJECT)
+		case COMPONENT_BUILD_BUFFER_INDEX:
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_GROUP_MERGE_BUFFER_OBJECT)
+		case COMPONENT_GROUP_MERGE_BUFFER_INDEX:
+#endif
+		{
+			/* Alignment should be at least happen at ROGUE_CACHE_LINE_SIZE, however, in order to make sure
+			   uniform buffer object works, it needs to be RGX_USCINST_DYNAMIC_CONSTANT_FETCH_BASE_ADDRESS_UNITS
+			   aligned.
+
+			   As we cannot tell if a buffer object is going to be used for uniform block at its creating time,
+			   it is necessary to setup the alignment as Least Common Multiple (LCM) of these two values for all different
+			   types buffer objects.
+
+			   For rogue, currently, the final LCM value is RGX_USCINST_DYNAMIC_CONSTANT_FETCH_BASE_ADDRESS_UNITS.
+			 */
+			uiAllocAlign = MAX(RGX_USCINST_DYNAMIC_CONSTANT_FETCH_BASE_ADDRESS_UNITS, ROGUE_CACHE_LINE_SIZE);
+
+			/* Overallocate by a Dword in case the PDS fetches
+				vertex data at the end of the allocation and pulls in an extra cache line.
+			*/
+			(*pui32AllocSize) = TRUNCATE_64BITS_TO_32BITS(ALIGNCOUNT((IMG_UINT32)size + 4, uiAllocAlign));
+			(*puiAllocAlign) = uiAllocAlign;
+
+			break;
+		}
+		default:
+		{
+			PVR_DPF((PVR_DBG_ERROR, "GetDataStoreHWOffsetAndSize: Unknown target index"));
+
+			*pui32AllocSize = 0;
+			*puiAllocAlign = 0;
+
+			bRet = IMG_FALSE;
+
+			break;
+		}
+	}
+
+	return bRet;
+}
+
+/***********************************************************************************
+ Function Name      : ProcessBufferDataStoreChange
+ Inputs             : gc, psBufferObject,
+                      bDataStoreRealloc, bDataStoreContentChange
+ Outputs            : -
+ Returns            : -
+ Description        : This function must be called after buffer data store has been
+                      changed, this includes:
+					  1) change of the address of data store itself because of
+					     re-allocation such as by calling glBufferData
+					  2) change of the content of data store such as by calling
+					     glBufferData, glBufferSubData and glUnmapBuffer.
+************************************************************************************/
+GLES_STATIC void ProcessBufferDataStoreChange(GLES3Context *gc, GLES3BufferObject *psBufferObject,
+										 IMG_BOOL bDataStoreRealloc, IMG_BOOL bDataStoreContentChange)
+{
+	if ((!bDataStoreRealloc) && (!bDataStoreContentChange))
+	{
+		return;
+	}
+
+	/* Data store change affects the setup of uniform buffer object used in the current program */
+	ChangeUniformBufferDataStore(gc, psBufferObject, bDataStoreRealloc, bDataStoreContentChange);
+
+	/* Data store change affects the setup of shader storage buffer object used in the current program */
+	ChangeShaderStorageBufferDataStore(gc, psBufferObject, bDataStoreRealloc, bDataStoreContentChange);
+
+	/* Data store reallocate change */
+	if (bDataStoreRealloc)
+	{
+		GLES3VertexArrayObject *psVAO = gc->sVAOMachine.psActiveVAO;
+		GLES_ASSERT(VAO(gc));
+
+		/*  Setup VAO: mark as dirty so we will spot the invalid memory if someone tries to draw with it */
+		psVAO->ui32DirtyState |= GLES3_DIRTYFLAG_VAO_ATTRIB_STREAM;
+
+		if (psBufferObject->psMemInfo != NULL)
+		{
+			/* Setup dirty state for VAO's element buffer */
+			if (VAO_INDEX_BUFFER_OBJECT(gc))
+			{
+				if (psVAO->psBoundElementBuffer == psBufferObject)
+				{
+					psVAO->ui32DirtyState |= GLES3_DIRTYFLAG_VAO_ELEMENT_BUFFER;
+				}
+			}
+		}
+
+		/* Process the effects on transform feedback objects, including default transform feedback object.
+
+		   Possibility of Enhancement:
+		   not doing unnecessary check by adding a ref count to indicate if the buf obj is really used in any tfo.
+		 */
+		ProcessBufferDataStoreChangeForActiveTransformFeedback(gc, (void *)psBufferObject, &gc->sTFOMachine.psDefaultTFObject->sNamedItem);
+
+		NamesArrayMapFunction(gc, gc->apsNamesArray[GLES3_NAMETYPE_TFOBJ - GLES3_MAX_SHAREABLE_NAMETYPE],
+			ProcessBufferDataStoreChangeForActiveTransformFeedback, (void *)psBufferObject);
+
+		/* Invalidate the image state of the buffer textures attached to the buffer object */
+		GLES3TextureListNode* psTexNode = psBufferObject->psBufferTextureList;
+		while (psTexNode)
+		{
+			MARK_TEXTURE_STATE_DIRTY(gc, psTexNode->psTexture);
+			psTexNode  = psTexNode->psNextItem;
+		}
+	}
+
+	/* Data store change affects the setup of atomic counters buffer object used in the current program */
+	ChangeAtomicCountersBufferDataStore(gc, psBufferObject, bDataStoreRealloc, bDataStoreContentChange);
+
+	/* !!! Add here if data store change has more effects !!! */
+}
+
+/***********************************************************************************
+ Function Name      : CopyBetweenBufferDataStores
+ Inputs             : gc,
+                      pvDestCpuVirtAddr, ui32DestOffset,
+					  pvSourceCpuVirtAddr, ui32SourceOffset,
+                      ui32Length
+ Outputs            : -
+ Returns            : -
+ Description        : Copy the content between two buffer data stores.
+************************************************************************************/
+static void CopyBetweenBufferDataStores(GLES3Context *gc,
+										PVRSRV_MEMINFO *psDstMemInfo, void *pvDestCpuVirtAddr, IMG_UINT32 ui32DestOffset,
+										PVRSRV_MEMINFO *psSrcMemInfo, void *pvSourceCpuVirtAddr, IMG_UINT32 ui32SourceOffset,
+										IMG_UINT32 ui32Length)
+{
+	/* Possibility of Enhancement:
+	   Currently only memcpy is used, this can be changed to
+	   use TQ for fast copying between device memory.
+
+	   Use memcpy is also slow as we need to wait for the buffer is not
+	   used.
+	 */
+
+	PVR_UNREFERENCED_PARAMETER(gc);
+	PVR_UNREFERENCED_PARAMETER(psDstMemInfo);
+	PVR_UNREFERENCED_PARAMETER(psSrcMemInfo);
+
+	if(gc->ui32DevmemCacheFlushOn)
+	{
+
+		FlushCachedDevmemRange(psSrcMemInfo, ui32SourceOffset, ui32Length, GL_MAP_READ_BIT);
+
+		GLES3CachedMemCopy((void *)(((IMG_UINT8 *)pvDestCpuVirtAddr) + ui32DestOffset),
+				 (const void *)(((IMG_UINT8 *)pvSourceCpuVirtAddr) + ui32SourceOffset), ui32Length);
+
+		FlushCachedDevmemRange(psDstMemInfo, ui32DestOffset, ui32Length, GL_MAP_WRITE_BIT);
+	}
+	else
+	{
+		GLES3DeviceMemCopy((void *)(((IMG_UINT8 *)pvDestCpuVirtAddr) + ui32DestOffset),
+				 (const void *)(((IMG_UINT8 *)pvSourceCpuVirtAddr) + ui32SourceOffset), ui32Length);
+	}
+}
+
+IMG_INTERNAL IMG_UINT32 GetBufferObjectTQExtraFenceMask(GLES3BufferObject *psBufferObject)
+{
+    IMG_UINT32 ui32ExtraFenceMask = 0;
+
+    if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_CDM) != 0)
+    {
+        ui32ExtraFenceMask |= SYNC_UPDATE_CDM_BIT;
+    }
+
+    if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_TA) != 0)
+    {
+        ui32ExtraFenceMask |= SYNC_UPDATE_TA_BIT;
+    }
+
+    if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_3D) != 0)
+    {
+        ui32ExtraFenceMask |= SYNC_UPDATE_RENDER_BIT;
+    }
+
+    return ui32ExtraFenceMask;
+}
+
+/***********************************************************************************
+ Function Name      : TQCopyBetweenBufferDataStores
+ Inputs             : gc,
+                      psDestBuffer, psDestMemInfo, ui32DestOffset,
+					  psSourceBuffer, psSourceMemInfo, ui32SourceOffset,
+                      ui32Length
+ Outputs            : -
+ Returns            : left length which cannot be handled by TQ
+ Description        : Copy the content between two data stores using TQ operation.
+************************************************************************************/
+static IMG_UINT32 TQCopyBetweenBufferDataStores(GLES3Context *gc,
+                                                GLES3BufferObject *psDestBuffer, RMResource *psDestResource, PVRSRV_MEMINFO *psDestMemInfo, IMG_UINT32 ui32DestOffset,
+										        GLES3BufferObject *psSourceBuffer, RMResource *psSourceResource, PVRSRV_MEMINFO *psSourceMemInfo, IMG_UINT32 ui32SourceOffset,
+										        IMG_UINT32 ui32Length, PVRSRV_MEMINFO *psBufferToFree)
+{
+    TQ_SURFACE sSrcSurface, sDstSurface;
+    IMG_UINT32 ui32ExtraFenceMask = 0, ui32TotalLength = ui32Length;
+	IMG_UINT32 ui32Flags = TQ_CMD_FLAGS_PDUMP_CONTINUOUS;
+
+    const IMG_UINT32 ui32MaxTilesInWidth = GLES3_MAX_RENDERBUFFER_SIZE / RGX_FEATURE_TILE_SIZE_X;
+    const IMG_UINT32 ui32MaxTilesInHeight = GLES3_MAX_RENDERBUFFER_SIZE / RGX_FEATURE_TILE_SIZE_Y;
+
+    IMG_UINT32 ui32BytePP, ui32TileCopySize, ui32ScanLineInTexels;
+    IMG_PIXFMT ePixFormat;
+    TQMArgs sArgs = {0};
+
+#if !defined(RGX_FEATURE_TLA) || defined(FIX_HW_BRN_37270)
+    /* TQ HW limitations */
+    IMG_UINT32 ui32AlignOr = (((IMG_UINT32)psSourceMemInfo->sDevVirtAddr.uiAddr) + ui32SourceOffset) |
+    						 (((IMG_UINT32)psDestMemInfo->sDevVirtAddr.uiAddr) + ui32DestOffset) |
+							 ui32Length;
+
+    if (ui32AlignOr & 0x03)
+    {
+        /* Not fully dword-aligned. We cannot copy using 3D TQ */
+        PVR_DPF((PVR_DBG_ERROR,"TQCopyBetweenBufferDataStores: address alignment is not satisfied for TQ copy"));
+        return ui32Length;
+    }
+#endif
+
+#if defined(EGL_EXTENSION_CONTENT_PROTECTED)
+	if (gc->bIsProtectedContext)
+		ui32Flags |= TQ_CMD_FLAGS_SECURE;
+#endif
+
+    /* Source surface */
+	sSrcSurface.ui32Flags			= 0;
+	sSrcSurface.hMemDesc			= psSourceMemInfo->hMemDesc;
+	sSrcSurface.ui32MemoryOffset	= ui32SourceOffset;
+	sSrcSurface.ui32SampleCount		= 1;
+	sSrcSurface.eFBCompression		= IMG_FB_COMPRESSION_NONE;
+
+	/* Destination surface */
+	sDstSurface.ui32Flags			= 0;
+    sDstSurface.hMemDesc			= psDestMemInfo->hMemDesc;
+    sDstSurface.ui32MemoryOffset	= ui32DestOffset;
+    sDstSurface.ui32SampleCount		= 1;
+	sDstSurface.eFBCompression		= IMG_FB_COMPRESSION_NONE;
+
+#if defined(PDUMP)
+    if(PDUMP_ISCAPTURING(gc))
+    {
+        PDUMP_STRING_CONTINUOUS((gc, "TQ: buffer data store (name,address,offset)(%u,0x%010llX,%d->%u,0x%010llX,%d, size: %d)\n",
+            psSourceBuffer == NULL ? 0 : psSourceBuffer->sNamedItem.ui32Name,
+            (unsigned long long) psSourceMemInfo->sDevVirtAddr.uiAddr, ui32SourceOffset,
+            psDestBuffer == NULL ? 0 : psDestBuffer->sNamedItem.ui32Name,
+            (unsigned long long) psDestMemInfo->sDevVirtAddr.uiAddr, ui32DestOffset,
+            ui32Length));
+    }
+#endif
+
+    if (psDestBuffer != NULL)
+    {
+        ui32ExtraFenceMask |= GetBufferObjectTQExtraFenceMask(psDestBuffer);
+    }
+
+    if (psSourceBuffer != NULL)
+    {
+        ui32ExtraFenceMask |= GetBufferObjectTQExtraFenceMask(psSourceBuffer);
+    }
+
+#if defined(RGX_FEATURE_TLA) && !defined(FIX_HW_BRN_37270)
+    /* On TLA feature presented HW, use TLA first as this is just purely data copy between
+       two piece of device memory.
+     */
+
+    sSrcSurface.ePixFormat			= IMG_PIXFMT_R8_UINT;
+    sSrcSurface.eMemLayout		    = IMG_MEMLAYOUT_STRIDED;
+
+    sDstSurface.ePixFormat			= IMG_PIXFMT_R8_UINT;
+    sDstSurface.eMemLayout		    = IMG_MEMLAYOUT_STRIDED;
+
+    while (ui32Length > 0)
+    {
+    	const IMG_UINT32 ui32TLAMaxWidth = TQ_MAX_STRIDE_IN_PIXELS_TLA;
+    	const IMG_UINT32 ui32TLAMaxHeight = TQ_MAX_STRIDE_IN_PIXELS_TLA;
+
+        IMG_UINT32 ui32CopySize;
+
+        if (ui32Length / (ui32TLAMaxWidth * ui32TLAMaxHeight) > 0)
+        {
+            ui32CopySize = ui32TLAMaxWidth * ui32TLAMaxHeight;
+
+            sSrcSurface.ui32Width			= ui32TLAMaxWidth;
+	        sSrcSurface.ui32Height			= ui32TLAMaxHeight;
+            sSrcSurface.i32StrideInTexels	= ui32TLAMaxWidth;
+        }
+        else if (ui32Length / ui32TLAMaxWidth > 0)
+        {
+            ui32CopySize = ui32Length / ui32TLAMaxWidth * ui32TLAMaxWidth;
+
+            sSrcSurface.ui32Width			= ui32TLAMaxWidth;
+	        sSrcSurface.ui32Height			= ui32Length / ui32TLAMaxWidth;
+            sSrcSurface.i32StrideInTexels	= sSrcSurface.ui32Width;
+        }
+        else
+        {
+            ui32CopySize = ui32Length;
+
+            sSrcSurface.ui32Width			= ui32Length;
+	        sSrcSurface.ui32Height			= 1;
+            sSrcSurface.i32StrideInTexels	= ui32Length;
+        }
+
+        sSrcSurface.sRectangle.x0		= 0;
+	    sSrcSurface.sRectangle.y0		= 0;
+	    sSrcSurface.sRectangle.x1		= sSrcSurface.ui32Width;
+	    sSrcSurface.sRectangle.y1		= sSrcSurface.ui32Height;
+
+        sDstSurface.ui32Width = sSrcSurface.ui32Width;
+	    sDstSurface.ui32Height = sSrcSurface.ui32Height;
+        sDstSurface.i32StrideInTexels = sSrcSurface.i32StrideInTexels;
+	    sDstSurface.ePixFormat = sSrcSurface.ePixFormat;
+        sDstSurface.eMemLayout = sSrcSurface.eMemLayout;
+	    sDstSurface.sRectangle = sSrcSurface.sRectangle;
+
+        /* Issue the TQ operation */
+
+		sArgs.hCheckFence = PVRSRV_NO_FENCE;
+		sArgs.apsSrcResources[0] = psSourceResource;
+		sArgs.apsDstResources[0] = psDestResource;
+		sArgs.psBufferToFree = (ui32CopySize == ui32Length) ? psBufferToFree : NULL;
+
+        if(!TQMQueueTransfer(&gc->sRMCtx,
+        					 &sSrcSurface,
+						     &sDstSurface,
+						     NULL,
+						     1,
+						     TQ_FILTERTYPE_POINT,
+						     IMG_RESOLVE_BLEND,
+						     ui32Flags,
+						     TQ_ROUTE_ONLY_TLA,
+						     0,
+						     NULL,
+						     NULL,
+						     &sArgs))
+	    {
+            PVR_DPF((PVR_DBG_ERROR,"TQCopyBetweenBufferDataStores: TQMQueueTransfer failed"));
+
+            /* TLA should be more capability than 3D TQ in data copy case, do not try 3D TQ if TLA failed. */
+		    goto TQCopyBetweenBufferDataStores_Finish;
+	    }
+
+#if (defined(PERFDATA) || defined(RM_DEBUG)) && defined(__linux__)
+		PrintRenderInfoTQ(gc, "TQ Copy Buffer (%d x %d) (TLA_ONLY)", sSrcSurface.ui32Width, sSrcSurface.ui32Height);
+#endif
+
+        /* Update length for the next possible blit */
+        ui32Length -= ui32CopySize;
+        sSrcSurface.ui32MemoryOffset += ui32CopySize;
+        sDstSurface.ui32MemoryOffset += ui32CopySize;
+
+        ui32ExtraFenceMask = 0;
+    }
+#endif
+
+    /* Try 3D TQ now.
+
+       Data copy can be split into multiple copies
+       The first split is based on Tile unit as this is fast as can be down in HW
+       The second split is the left data which is within the tile.  Process the portion
+       that is fully occupied the width.
+       The final possible left is one scan line.
+     */
+
+    /* Start with full use of HW */
+    ePixFormat = IMG_PIXFMT_R32G32_UINT;
+    ui32BytePP = IMGPixFmtGetBPP(ePixFormat) >> 3;
+    ui32TileCopySize = RGX_FEATURE_TILE_SIZE_X * RGX_FEATURE_TILE_SIZE_Y * ui32BytePP;
+    ui32ScanLineInTexels = ui32MaxTilesInWidth * RGX_FEATURE_TILE_SIZE_X;
+
+    while (ui32Length > 0)
+    {
+        IMG_UINT32 ui32CopySize;
+        IMG_UINT32 ui32NumTiles = ui32Length / ui32TileCopySize;
+        IMG_UINT32 ui32JobRef;
+
+        if (ui32NumTiles / (ui32MaxTilesInWidth * ui32MaxTilesInHeight) > 0)
+        {
+            ui32NumTiles = ui32MaxTilesInWidth * ui32MaxTilesInHeight;
+            ui32CopySize = ui32NumTiles * ui32TileCopySize;
+
+            sSrcSurface.ui32Width			= ui32MaxTilesInWidth * RGX_FEATURE_TILE_SIZE_X;
+	        sSrcSurface.ui32Height			= ui32MaxTilesInHeight * RGX_FEATURE_TILE_SIZE_Y;
+            sSrcSurface.i32StrideInTexels	= sSrcSurface.ui32Width;
+	        sSrcSurface.ePixFormat			= ePixFormat;
+            sSrcSurface.eMemLayout		    = IMG_MEMLAYOUT_TWIDDLED;
+        }
+        else if (ui32Length / (ui32ScanLineInTexels * ui32BytePP) > 0)
+        {
+            sSrcSurface.ui32Width           = ui32ScanLineInTexels;
+            sSrcSurface.ui32Height          = ui32Length / (ui32ScanLineInTexels * ui32BytePP);
+            sSrcSurface.i32StrideInTexels   = sSrcSurface.ui32Width;
+            sSrcSurface.ePixFormat          = ePixFormat;
+            sSrcSurface.eMemLayout          = IMG_MEMLAYOUT_STRIDED;
+
+            ui32CopySize = sSrcSurface.ui32Width * sSrcSurface.ui32Height * ui32BytePP;
+        }
+        else if ((ui32Length / ui32BytePP > 0) && (ui32Length % ui32BytePP == 0))
+        {
+            ui32CopySize = ui32Length;
+
+            sSrcSurface.ui32Width           = ui32Length / ui32BytePP;
+	        sSrcSurface.ui32Height			= 1;
+            sSrcSurface.i32StrideInTexels   = sSrcSurface.ui32Width;
+            sSrcSurface.ePixFormat          = ePixFormat;
+            sSrcSurface.eMemLayout		    = IMG_MEMLAYOUT_STRIDED;
+        }
+        else if (ui32Length / ui32ScanLineInTexels > 0)
+        {
+            sSrcSurface.ui32Width           = ui32ScanLineInTexels;
+            sSrcSurface.ui32Height          = ui32Length / ui32ScanLineInTexels;
+            sSrcSurface.i32StrideInTexels   = sSrcSurface.ui32Width;
+            sSrcSurface.ePixFormat          = IMG_PIXFMT_R8_UINT;
+            sSrcSurface.eMemLayout          = IMG_MEMLAYOUT_STRIDED;
+
+            ui32CopySize = sSrcSurface.ui32Width * sSrcSurface.ui32Height;
+        }
+        else
+        {
+            ui32CopySize = ui32Length;
+
+            sSrcSurface.ui32Width           = ui32Length;
+            sSrcSurface.ui32Height          = 1;
+            sSrcSurface.i32StrideInTexels   = sSrcSurface.ui32Width;
+            sSrcSurface.ePixFormat          = IMG_PIXFMT_R8_UINT;
+            sSrcSurface.eMemLayout          = IMG_MEMLAYOUT_STRIDED;
+        }
+
+        sSrcSurface.sRectangle.x0		= 0;
+	    sSrcSurface.sRectangle.y0		= 0;
+	    sSrcSurface.sRectangle.x1		= sSrcSurface.ui32Width;
+	    sSrcSurface.sRectangle.y1		= sSrcSurface.ui32Height;
+
+        sDstSurface.ui32Width = sSrcSurface.ui32Width;
+	    sDstSurface.ui32Height = sSrcSurface.ui32Height;
+        sDstSurface.i32StrideInTexels = sSrcSurface.i32StrideInTexels;
+	    sDstSurface.ePixFormat = sSrcSurface.ePixFormat;
+        sDstSurface.eMemLayout = sSrcSurface.eMemLayout;
+	    sDstSurface.sRectangle = sSrcSurface.sRectangle;
+
+#if defined(DEBUG)
+        if (sSrcSurface.eMemLayout == IMG_MEMLAYOUT_TWIDDLED)
+        {
+            /* Twiddled requires size to be POT */
+            GLES_ASSERT(IsPower2(sSrcSurface.ui32Width) && IsPower2(sSrcSurface.ui32Height));
+        }
+        else if (sSrcSurface.ui32Height > 1)
+        {
+            /* Strided must be two pixels a group */
+            GLES_ASSERT(sSrcSurface.ui32Width % 2 == 0);
+        }
+#endif
+
+#if (defined(PERFDATA) || defined(RM_DEBUG)) && defined(__linux__)
+		PrintRenderInfoTQ(gc, "TQ Copy Buffer (%d x %d) (AUTO)", sSrcSurface.ui32Width, sSrcSurface.ui32Height);
+
+#endif
+
+		PVRSRVLockMutex(gc->psSysContext->hExtJobRefMutex);
+		ui32JobRef = ++gc->psSysContext->ui32JobRef;
+		PVRSRVUnlockMutex(gc->psSysContext->hExtJobRefMutex);
+
+		HWPerfClientTQFuncStart(gc->psSysContext->psDevConnection, ui32JobRef, gc->ui32ContextID, &sSrcSurface, &sDstSurface, "TQ CopyBuf");
+
+        /* Issue the TQ operation */
+		sArgs.hCheckFence = PVRSRV_NO_FENCE;
+		sArgs.apsSrcResources[0] = psSourceResource;
+		sArgs.apsDstResources[0] = psDestResource;
+		sArgs.psBufferToFree = (ui32CopySize == ui32Length) ? psBufferToFree : NULL;
+
+        if(!TQMQueueTransfer(&gc->sRMCtx,
+						     &sSrcSurface,
+						     &sDstSurface,
+						     NULL,
+						     1,
+						     TQ_FILTERTYPE_POINT,
+						     IMG_RESOLVE_BLEND,
+						     ui32Flags,
+						     TQ_ROUTE_AUTO,
+						     0,
+						     NULL,
+						     NULL,
+						     &sArgs))
+	    {
+    		HWPerfClientTQFuncEnd(gc->psSysContext->psDevConnection, ui32JobRef, gc->ui32ContextID);
+
+            if (ePixFormat == IMG_PIXFMT_R32G32_UINT)
+            {
+                /* Try with IMG_PIXFMT_R32_UINT format */
+                ePixFormat = IMG_PIXFMT_R32_UINT;
+                ui32BytePP = IMGPixFmtGetBPP(ePixFormat) >> 3;
+                ui32TileCopySize = RGX_FEATURE_TILE_SIZE_X * RGX_FEATURE_TILE_SIZE_Y * ui32BytePP;
+
+                continue;
+            }
+
+		    PVR_DPF((PVR_DBG_ERROR,"TQCopyBetweenBufferDataStores: TQMQueueTransfer failed"));
+
+		    goto TQCopyBetweenBufferDataStores_Finish;
+	    }
+		HWPerfClientTQFuncEnd(gc->psSysContext->psDevConnection, ui32JobRef, gc->ui32ContextID);
+
+        /* Update length for the next possible blit */
+        ui32Length -= ui32CopySize;
+        sSrcSurface.ui32MemoryOffset += ui32CopySize;
+        sDstSurface.ui32MemoryOffset += ui32CopySize;
+
+        ui32ExtraFenceMask = 0;
+    }
+
+TQCopyBetweenBufferDataStores_Finish:
+
+    if (ui32TotalLength != ui32Length)
+    {
+	    PVRSRVLockMutex(gc->psSharedState->hPrimaryLock);
+
+        if (psDestBuffer != NULL)
+        {
+	        SetupBufferObjectUseMethodFlag(gc, psDestBuffer, GLES3_BUFFER_FILLED_BY_TQ, IMG_FALSE);
+        }
+
+        if (psSourceBuffer != NULL)
+        {
+            SetupBufferObjectUseMethodFlag(gc, psSourceBuffer, GLES3_BUFFER_USED_IN_TQ, IMG_FALSE);
+        }
+
+        PVRSRVUnlockMutex(gc->psSharedState->hPrimaryLock);
+    }
+
+	return ui32Length;
+}
+
+/***********************************************************************************
+ Function Name      : WaitUntilBufObjNotUsedInTA
+ Inputs             : gc, psBufObj, pbDataStoreContentChanged
+ Outputs            : If data store content changed
+ Returns            : Success/Failure
+ Description        : Waits until a buffer object is no longer needed by the TA
+************************************************************************************/
+static IMG_BOOL WaitUntilBufObjNotUsedInTA(GLES3Context *gc, GLES3BufferObject *psBufObj,
+										   IMG_BOOL *pbDataStoreContentChanged)
+{
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_FALSE;
+	}
+
+	if (!WaitUntilResourceNotUsedInTA(gc, gc->psSysContext->psRM, &psBufObj->sRMResource))
+	{
+		return IMG_FALSE;
+	}
+
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_TRUE;
+	}
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : WaitUntilBufObjNotUsedIn3D
+ Inputs             : gc, psBufObj, pbDataStoreContentChanged
+ Outputs            : If data store content changed
+ Returns            : Success/Failure
+ Description        : Waits until a buffer object is no longer needed by the 3D
+************************************************************************************/
+static IMG_BOOL WaitUntilBufObjNotUsedIn3D(GLES3Context *gc, GLES3BufferObject *psBufObj,
+										   IMG_BOOL *pbDataStoreContentChanged)
+{
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_FALSE;
+	}
+
+	if (!WaitUntilResourceNotUsedIn3D(gc, gc->psSysContext->psRM, &psBufObj->sRMResource))
+	{
+		return IMG_FALSE;
+	}
+
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_TRUE;
+	}
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : WaitUntilBufObjNotUsedInCDM
+ Inputs             : gc, psBufObj, pbDataStoreContentChanged
+ Outputs            : If data store content changed
+ Returns            : Success/Failure
+ Description        : Waits until a buffer object is no longer needed by the CDM
+************************************************************************************/
+static IMG_BOOL WaitUntilBufObjNotUsedInCDM(GLES3Context *gc, GLES3BufferObject *psBufObj,
+										   IMG_BOOL *pbDataStoreContentChanged)
+{
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_FALSE;
+	}
+
+	if (!WaitUntilResourceNotUsedInCDM(gc, gc->psSysContext->psRM, &psBufObj->sRMResource))
+	{
+		return IMG_FALSE;
+	}
+
+	if (pbDataStoreContentChanged != NULL)
+	{
+		*pbDataStoreContentChanged = IMG_TRUE;
+	}
+
+	return IMG_TRUE;
+}
+
+static void SubmitGhostObj(GLES3Context *gc, GLES3BufferObjectGhost *psBufObjGhost)
+{
+	if(psBufObjGhost->psMemInfo)
+	{
+		/* We no longer need the CPU mapping for the ghost meminfo */
+		PVRSRVReleaseCPUMapping(psBufObjGhost->psMemInfo->hMemDesc);
+	}
+
+	RM_GhostResourceEnd(gc->psSysContext->psRM, &psBufObjGhost->sRMResource);
+
+#if defined(DEFERRED_WORKER_THREAD)
+
+	/* Queue a task to free the ghost */
+	if (gc->sAppHints.bAsyncGhostFreeing)
+	{
+		PVRSRVQueueDeferredTask(gc->psSysContext->psTaskContext, gc->hDestroyUnneededGhostsTask);
+	}
+
+#endif	/* defined(DEFERRED_WORKER_THREAD) */
+}
+
+/***********************************************************************************
+ Function Name      : GhostBufObj
+ Inputs             : gc, psBufObj, bCreateNewDataStore, bCopyOldContent
+ Outputs            : -
+ Returns            : Success/Failure
+ Description        : Ghost a buffer object if necessary.
+
+                      dataStoreAction specifies the action on data store after ghosting.
+************************************************************************************/
+static IMG_BOOL GhostBufObj(GLES3Context *gc, GLES3BufferObject *psBufObj, IMG_BOOL bCreateNewDataStore, IMG_BOOL bCopyOldContent, IMG_BOOL bCPUCopy)
+{
+	GLES3BufferObjectGhost *psBufObjGhost;
+	void *pvBufObjGhostCpuVirtAddr;
+
+	if(!RM_IsResourceNeeded(gc->psSysContext->psRM, &psBufObj->sRMResource, RM_USAGE_READ|RM_USAGE_WRITE))
+	{
+#if defined(PDUMP)
+		RM_WaitUntilResourceIsNotNeeded(gc->psSysContext->psRM, &psBufObj->sRMResource);
+#endif
+
+		return IMG_TRUE;
+	}
+
+	/* Ghost the buffer object data store */
+	psBufObjGhost = (GLES3BufferObjectGhost *)GLES3Calloc(sizeof(GLES3BufferObjectGhost));
+
+	if(!psBufObjGhost)
+	{
+		PVR_DPF((PVR_DBG_ERROR, "GhostBufObj: Out of memory. Could not ghost buffer object at %p", psBufObj));
+		return IMG_FALSE;
+	}
+
+	/* Pass the data store to ghost buffer object data store */
+	psBufObjGhost->psMemInfo = psBufObj->psMemInfo;
+
+	/* Back up the CPU mapping pointer for the pre-ghosted object.
+	   We'll re-use the pointer below when copying the current contents back
+	   from the ghost, so don't release the mapping yet.
+	 */
+	pvBufObjGhostCpuVirtAddr = psBufObj->pvCpuVirtAddr;
+
+	/* Reset the data store of original buffer object to empty.
+	   This data store will be re-created by the calling function if necessary.
+	 */
+	psBufObj->psMemInfo = NULL;
+	psBufObj->pvCpuVirtAddr = NULL;
+
+	/* Create a new buffer data store if required */
+	if (bCreateNewDataStore)
+	{
+		IMG_CHAR szRIAPIString[DEVMEM_ANNOTATION_MAX_LEN];
+
+		snprintf(szRIAPIString, sizeof(szRIAPIString), "GhostBufObj mem for new copy BufID=%d Size=%d", (psBufObj->sNamedItem).ui32Name, psBufObj->ui32BufferSize);
+
+		if (GLES3ALLOCDEVICEMEM(gc->psSysContext->hGeneralHeap,
+								PVRSRV_MEMALLOCFLAG_CPU_READABLE | PVRSRV_MEMALLOCFLAG_CPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsCPU |
+								PVRSRV_MEMALLOCFLAG_GPU_READABLE | PVRSRV_MEMALLOCFLAG_GPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsGPU,
+								psBufObjGhost->psMemInfo->uiAllocationSize,
+								psBufObj->sAllocAlign,
+								szRIAPIString,
+								&psBufObj->psMemInfo) != PVRSRV_OK)
+		{
+			/* Destroy unneeded ghost and try to allocate once more */
+			RM_DestroyUnneededGhosts(gc, RM_CONTEXT_OPENGLES3, gc->psSysContext->psRM);
+
+			if (GLES3ALLOCDEVICEMEM(gc->psSysContext->hGeneralHeap,
+									PVRSRV_MEMALLOCFLAG_CPU_READABLE | PVRSRV_MEMALLOCFLAG_CPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsCPU |
+									PVRSRV_MEMALLOCFLAG_GPU_READABLE | PVRSRV_MEMALLOCFLAG_GPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsGPU,
+									psBufObjGhost->psMemInfo->uiAllocationSize,
+									psBufObj->sAllocAlign,
+									szRIAPIString,
+									&psBufObj->psMemInfo) != PVRSRV_OK)
+			{
+				/* Recover old data store */
+				psBufObj->psMemInfo = psBufObjGhost->psMemInfo;
+				psBufObj->pvCpuVirtAddr = pvBufObjGhostCpuVirtAddr;
+
+				PVR_DPF((PVR_DBG_ERROR,"GhostBufObj: Can't allocate new data store for a ghosted buffer object"));
+
+				SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+											  "not enough memory to create data store for ghost buffer object",
+											  psBufObj->sNamedItem.pszLabel);
+
+				GLES3Free(psBufObjGhost);
+				return IMG_FALSE;
+			}
+		}
+
+        /* Acquire CPU mapping for new buffer object allocation */
+		if (PVRSRVAcquireCPUMapping(psBufObj->psMemInfo->hMemDesc,
+									&psBufObj->pvCpuVirtAddr) != PVRSRV_OK)
+		{
+			GLES3FREEDEVICEMEM(psBufObj->psMemInfo);
+
+			/* Recover old data store */
+			psBufObj->psMemInfo = psBufObjGhost->psMemInfo;
+			psBufObj->pvCpuVirtAddr = pvBufObjGhostCpuVirtAddr;
+
+			PVR_DPF((PVR_DBG_ERROR,"GhostBufObj: Can't acquire CPU mapping for a ghosted buffer object"));
+
+			SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+										  "not enough memory to create data store for ghost buffer object",
+										  psBufObj->sNamedItem.pszLabel);
+
+			GLES3Free(psBufObjGhost);
+			return IMG_FALSE;
+		}
+
+		RM_GhostResourceBegin(gc->psSysContext->psRM, &psBufObj->sRMResource, &psBufObjGhost->sRMResource);
+
+		/* Copy the content, only allows copy content through TQ, if TQ fails,
+           ghost is marked as failed.  This is to make the logic of fall back code easy.
+         */
+        if (bCopyOldContent)
+        {
+            IMG_UINT32 ui32CopyLength = psBufObj->ui32BufferSize;
+
+            if (bCPUCopy)
+            {
+                psBufObj->ui32UseMethodFlag = 0;
+
+                CopyBetweenBufferDataStores(gc,
+                    psBufObj->psMemInfo, psBufObj->pvCpuVirtAddr, 0,
+                    psBufObjGhost->psMemInfo, pvBufObjGhostCpuVirtAddr, 0,
+                    ui32CopyLength);
+
+                SubmitGhostObj(gc, psBufObjGhost);
+                return IMG_TRUE;
+            }
+#if defined(RGX_FEATURE_TLA) || (defined(RGX_FEATURE_FASTRENDER_DM) && !defined(RGX_TDM_OVERLAP_WITH_3D_DISABLED))
+            else if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+            {
+                ui32CopyLength = TQCopyBetweenBufferDataStores(gc,
+                    psBufObj, &psBufObj->sRMResource, psBufObj->psMemInfo, 0,
+                    NULL, &psBufObjGhost->sRMResource, psBufObjGhost->psMemInfo, 0,
+                    psBufObj->ui32BufferSize, NULL);
+
+                if (ui32CopyLength == 0)
+                {
+                    /* TQ copy success, track ghost resource is in use by TQ */
+	            	psBufObjGhost->sRMResource.bIsValid = IMG_TRUE;
+	            	psBufObjGhost->sRMResource.bIsGhost = IMG_TRUE;
+                }
+                else if (ui32CopyLength < psBufObj->ui32BufferSize)
+                {
+                    /* Partially copied through TQ, we need to fall back to CPU copy */
+#if defined(DEBUG)
+                    if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+                    {
+                        PVR_DPF((PVR_DBG_WARNING, "GhostBufObj: %d out of %d is copied through CPU.  This is slow but NOT an error.", ui32CopyLength, psBufObj->ui32BufferSize));
+                    }
+#endif
+                    RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufObjGhost->sRMResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+
+                    psBufObj->ui32UseMethodFlag = 0;
+
+                    CopyBetweenBufferDataStores(gc,
+                         psBufObj->psMemInfo, psBufObj->pvCpuVirtAddr, psBufObj->ui32BufferSize - ui32CopyLength,
+                         psBufObjGhost->psMemInfo, pvBufObjGhostCpuVirtAddr, psBufObj->ui32BufferSize - ui32CopyLength,
+                        ui32CopyLength);
+
+                    SubmitGhostObj(gc, psBufObjGhost);
+			        return IMG_TRUE;
+                }
+            }
+#endif
+
+            if (ui32CopyLength == psBufObj->ui32BufferSize)
+            {
+            	/* Nothing is copied through TQ, mark ghost failed */
+                PVRSRVReleaseCPUMapping(psBufObj->psMemInfo->hMemDesc);
+
+				GLES3FREEDEVICEMEM(psBufObj->psMemInfo);
+
+			    /* Recover old data store */
+			    psBufObj->psMemInfo = psBufObjGhost->psMemInfo;
+			    psBufObj->pvCpuVirtAddr = pvBufObjGhostCpuVirtAddr;
+
+			    RM_GhostResourceCancel(gc->psSysContext->psRM, &psBufObj->sRMResource, &psBufObjGhost->sRMResource);
+			    GLES3Free(psBufObjGhost);
+
+			    return IMG_FALSE;
+            }
+        }
+	}
+	else
+	{
+		RM_GhostResourceBegin(gc->psSysContext->psRM, &psBufObj->sRMResource, &psBufObjGhost->sRMResource);
+		psBufObj->ui32BufferSize = 0;
+	}
+
+	SubmitGhostObj(gc, psBufObjGhost);
+	return IMG_TRUE;
+}
+
+/* Allocate a new data store with the size of original data store after ghost */
+#define GLES3_NEW_DATASTORE_AFTER_GHOST     0x00000001
+/* Fill the new create data store with content from original data store */
+#define GLES3_COPY_OLD_DATASTORE_CONTENT    0x00000002
+/* Copy old data store using cpu copy */
+#define GLES3_COPY_OLD_DATASTORE_CPU        0x00000004
+/* Ghost data store if it is still used in TA */
+#define GLES3_GHOST_DATASTORE_USED_IN_TA    0x00000008
+/* CPU block on data store */
+#define GLES3_CPU_BLOCK_ON_DATASTORE        0x00000010
+
+/***********************************************************************************
+ Function Name      : WaitForBufferObjectValidForChange
+ Inputs             : gc, psBufferObject, ui32DataStoreAction,
+ Outputs            : pbDataStoreReallocated
+ Returns            : Success/Failure
+ Description        : Wait for a buffer object until it is valid for change its
+                      content (Not psBufferObject itself).
+
+					  dataStoreAction specifies the action on data store after ghosting.
+
+                      The default behaviour for buffer object used in TA is wait
+                      for TA finish.  Use bForceTAGhost can override the default
+                      behaviour to make buffer used in TA may also be ghosted.
+
+					  The return of this function indicates if the buffer object can
+                      be changed for free.
+************************************************************************************/
+static IMG_BOOL WaitForBufferObjectValidForChange(GLES3Context *gc,
+                                                  GLES3BufferObject *psBufferObject,
+                                                  IMG_UINT32 ui32DataStoreAction,
+	                                              IMG_BOOL *pbDataStoreReallocated)
+{
+	if (pbDataStoreReallocated != NULL)
+	{
+		(*pbDataStoreReallocated) = IMG_FALSE;
+	}
+
+	/* Wait for CDM if necessary */
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_CDM) != 0)
+	{
+		psBufferObject->bUpdateAfterUse = IMG_TRUE;
+
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_CDM_FINISHED) == 0)
+		{
+			if (!WaitUntilBufObjNotUsedInCDM(gc, psBufferObject, NULL))
+			{
+				return IMG_FALSE;
+			}
+
+			/* Set up the flag to indicate that waiting for TA has been issued */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_CDM_FINISHED;
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_CDM;
+		}
+	}
+
+	/* We cannot tell if the TQ is happened in TLA or 3D.  Thus we can only wait for TQ to finish if
+	   the buffer used in TQ in order to safely change the buffer later.
+	 */
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_TQ) != 0)
+	{
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TQ_FINISHED) == 0)
+		{
+			if (((ui32DataStoreAction & (GLES3_NEW_DATASTORE_AFTER_GHOST | GLES3_COPY_OLD_DATASTORE_CONTENT | GLES3_COPY_OLD_DATASTORE_CPU | GLES3_CPU_BLOCK_ON_DATASTORE)) == 0) &&
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL) || defined(GLES31_EXTENSION_MEMORY_OBJECT)
+				!psBufferObject->bExternal &&
+#endif
+				((psBufferObject->ui32UseMethodFlag & (GLES3_BUFFER_USED_IN_TA | GLES3_BUFFER_USED_IN_3D | GLES3_BUFFER_TQ_GHOSTED)) == 0))
+			{
+                /* Ghost this buffer object data store */
+			    if (!GhostBufObj(gc, psBufferObject,
+                        (ui32DataStoreAction & GLES3_NEW_DATASTORE_AFTER_GHOST) != 0,
+                        (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CONTENT) != 0,
+                        (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CPU) != 0))
+			    {
+				    return IMG_FALSE;
+			    }
+
+			    if (pbDataStoreReallocated != NULL)
+			    {
+				    (*pbDataStoreReallocated) = IMG_TRUE;
+			    }
+
+			    LogKHRDebugWarningForObjectsIfDMEnabled(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+			    		KHR_DEBUG_MSG_BUFFER_MODIFIED_WHILE_IN_USE, psBufferObject->sNamedItem.pszLabel);
+
+				psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TQ_GHOSTED;
+			}
+			else
+			{
+				if (!RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufferObject->sRMResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES))
+				{
+					return IMG_FALSE;
+				}
+			}
+
+			/* Set up the flag to indicate that waiting for TQ has been issued */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TQ_FINISHED;
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_TQ;
+		}
+	}
+
+	/* For TA and 3D, in default behaviour, we always wait for TA if it is used in TA and then
+       ghost it if it is used in 3D.
+
+       We only ghost TA as required if buffer is not used in 3D at same time.
+	 */
+
+	/* Wait for TA or ghost TA if necessary */
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_TA) != 0)
+	{
+        if (((ui32DataStoreAction & GLES3_GHOST_DATASTORE_USED_IN_TA) != 0 && ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_3D) == 0)) &&
+            ((ui32DataStoreAction & GLES3_CPU_BLOCK_ON_DATASTORE) == 0))
+        {
+            /* Ghost for TA only necessary when buf object is not used in 3D, otherwise, 3D will ghost the buffer object anyway */
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL) || defined(GLES31_EXTENSION_MEMORY_OBJECT)
+			if(psBufferObject->bExternal)
+			{
+				RM_FlushUnKickedResource(gc->psSysContext->psRM, &psBufferObject->sRMResource, gc, KickUnFlushed_ScheduleTA, REASON_FLUSHFOR_FLUSHBUFFERS);
+				RM_WaitUntilResourceIsNotNeeded(gc->psSysContext->psRM, &psBufferObject->sRMResource);
+			}
+			else
+#endif
+			if (((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TA_GHOSTED) == 0))
+            {
+                /* Ghost this buffer object data store */
+			    if (!GhostBufObj(gc, psBufferObject,
+                        (ui32DataStoreAction & GLES3_NEW_DATASTORE_AFTER_GHOST) != 0,
+                        (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CONTENT) != 0,
+                        (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CPU) != 0))
+			    {
+				    return IMG_FALSE;
+			    }
+
+			    if (pbDataStoreReallocated != NULL)
+			    {
+				    (*pbDataStoreReallocated) = IMG_TRUE;
+			    }
+
+			    psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TA_GHOSTED;
+
+			    LogKHRDebugWarningForObjectsIfDMEnabled(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+			    		KHR_DEBUG_MSG_BUFFER_MODIFIED_WHILE_IN_USE, psBufferObject->sNamedItem.pszLabel);
+
+                if ((ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CONTENT) != 0)
+                {
+                    psBufferObject->bUpdateAfterUse = IMG_TRUE;
+                }
+            }
+
+            /* Set up the flag to indicate that this is new buffer object and no operation on it yet */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TA_FINISHED;
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_TA;
+        }
+        else
+        {
+            psBufferObject->bUpdateAfterUse = IMG_TRUE;
+
+		    if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TA_FINISHED) == 0)
+		    {
+                if (!WaitUntilBufObjNotUsedInTA(gc, psBufferObject, NULL))
+			    {
+				    return IMG_FALSE;
+			    }
+
+			    /* Set up the flag to indicate that waiting for TA has been issued */
+			    psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TA_FINISHED;
+			    psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_TA;
+		    }
+        }
+	}
+
+	/* Ghost 3D if necessary */
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_USED_IN_3D) != 0)
+	{
+        if ((ui32DataStoreAction & GLES3_CPU_BLOCK_ON_DATASTORE) != 0)
+        {
+            /* Wait for 3D finish */
+            if (!WaitUntilBufObjNotUsedIn3D(gc, psBufferObject, NULL))
+			{
+				return IMG_FALSE;
+			}
+        }
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL) || defined(GLES31_EXTENSION_MEMORY_OBJECT)
+		else if(psBufferObject->bExternal)
+		{
+			RM_FlushUnKickedResource(gc->psSysContext->psRM, &psBufferObject->sRMResource, gc, KickUnFlushed_ScheduleTA, REASON_FLUSHFOR_FLUSHBUFFERS);
+			RM_WaitUntilResourceIsNotNeeded(gc->psSysContext->psRM, &psBufferObject->sRMResource);
+		}
+#endif
+		else if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_3D_GHOSTED) == 0)
+		{
+			/* Ghost this buffer object data store */
+			if (!GhostBufObj(gc, psBufferObject,
+                    (ui32DataStoreAction & GLES3_NEW_DATASTORE_AFTER_GHOST) != 0,
+                    (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CONTENT) != 0,
+                    (ui32DataStoreAction & GLES3_COPY_OLD_DATASTORE_CPU) != 0))
+			{
+				return IMG_FALSE;
+			}
+
+			if (pbDataStoreReallocated != NULL)
+			{
+				(*pbDataStoreReallocated) = IMG_TRUE;
+			}
+
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_3D_GHOSTED;
+
+			LogKHRDebugWarningForObjectsIfDMEnabled(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+		    		KHR_DEBUG_MSG_BUFFER_MODIFIED_WHILE_IN_USE, psBufferObject->sNamedItem.pszLabel);
+		}
+
+        psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_3D_FINISHED;
+		psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_3D;
+	}
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : WaitForBufferObjectContentValid
+ Inputs             : gc, psBufferObject
+ Outputs            : -
+ Returns            : Success/Failure
+ Description        : Wait for a buffer object until the content of its data store
+                      is valid.  This is only for buffer object whose data store is
+					  filling by GL but not client.
+
+************************************************************************************/
+GLES_INTERNAL IMG_BOOL WaitForBufferObjectContentValid(GLES3Context *gc, GLES3BufferObject *psBufferObject)
+{
+	/* This function should broadcast data store content has been changed. */
+
+	IMG_BOOL bProcessContentChange = IMG_FALSE;
+	IMG_BOOL bContentChanged = IMG_TRUE;
+
+#if defined(RGX_FEATURE_COMPUTE)
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_CDM) != 0)
+	{
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_CDM_FINISHED) == 0)
+		{
+			if (!WaitUntilBufObjNotUsedInCDM(gc, psBufferObject, &bContentChanged))
+			{
+				return IMG_FALSE;
+			}
+
+			bProcessContentChange = IMG_TRUE;
+
+			/* Clear the flag */
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_FILLED_BY_CDM;
+			/* Mark wait for CDM is called */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_CDM_FINISHED;
+		}
+	}
+#endif
+
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_TQ) != 0)
+	{
+		/* The content of data store of a buffer object gets valid only after TQ finish,
+		   for example, buffer object used in ReadPixels
+	     */
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TQ_FINISHED) == 0)
+		{
+			/* Wait for TQ to finish */
+			if (!RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufferObject->sRMResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES))
+			{
+				return IMG_FALSE;
+			}
+
+			/* Always assume data content is changed */
+			bContentChanged = IMG_TRUE;
+			bProcessContentChange = IMG_TRUE;
+
+			/* Clear the flag */
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_FILLED_BY_TQ;
+			/* Mark wait for TQ is called */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TQ_FINISHED;
+		}
+	}
+
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_TA) != 0)
+	{
+		/* The content of data store of a buffer object gets valid only after TA finish,
+		   for example, buffer object used in transform feedback
+	     */
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_TA_FINISHED) == 0)
+		{
+			if (!WaitUntilBufObjNotUsedInTA(gc, psBufferObject, &bContentChanged))
+			{
+				return IMG_FALSE;
+			}
+
+			bProcessContentChange = IMG_TRUE;
+
+			/* Clear the flag */
+			psBufferObject->ui32UseMethodFlag &= ~(GLES3_BUFFER_FILLED_BY_TA | GLES3_BUFFER_FILLED_BY_TA_WITH_TF);
+			/* Mark wait for TA is called */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_TA_FINISHED;
+		}
+	}
+
+	if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_FILLED_BY_3D) != 0)
+	{
+		if ((psBufferObject->ui32UseMethodFlag & GLES3_BUFFER_3D_FINISHED) == 0)
+		{
+			if (!WaitUntilBufObjNotUsedIn3D(gc, psBufferObject, &bContentChanged))
+			{
+				return IMG_FALSE;
+			}
+
+			/* Clear the flags */
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_FILLED_BY_3D;
+
+			/* Mark wait for 3D is called and 3D is finished */
+			psBufferObject->ui32UseMethodFlag |= GLES3_BUFFER_3D_FINISHED;
+			psBufferObject->ui32UseMethodFlag &= ~GLES3_BUFFER_USED_IN_3D;
+
+			/* Issue wait, similar as in WaitUntilBufObjNotUsedInTA */
+
+			/* Process data store change similar as the following case */
+		}
+	}
+
+	if (bProcessContentChange)
+	{
+		ProcessBufferDataStoreChange(gc, psBufferObject, IMG_FALSE, bContentChanged);
+	}
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : GetGeneralBindingPoint
+ Inputs             : gc, i32TargetIndex, psBufferObject, ppsBufferBindingPoint
+                      i32Index, ui32Offset, ui32Size
+ Outputs            :
+ Returns            :
+ Description        : Assign a new buffer object to the specified buffer object binding
+                      point.  This function decrease the ref count of the original bound
+					  buffer object if exist, but not increase the ref count of the new
+					  buffer object which must be done manually outside calling this function.
+************************************************************************************/
+static void AssignBufferToBindingPoint(GLES3Context *gc, IMG_INT32 i32TargetIndex, GLES3NamesArray *psNamesArray,
+									   GLES3BufferObject *psBufferObject, GLES3BufferObject **ppsBufferBindingPoint,
+									   IMG_INT32 i32Index, GLES3BufferObjectIndexedBindingPoint *psIndexedBindingPoint,
+									   IMG_UINT32 ui32Offset, IMG_UINT32 ui32Size)
+{
+#if defined(GLES2_EXTENSION_KHR_DEBUG)
+	IMG_BOOL bIndexedBindingChanged = IMG_FALSE;
+
+	#define INDEXED_BINDING_CHANGED()	\
+			bIndexedBindingChanged = IMG_TRUE
+#else
+	#define INDEXED_BINDING_CHANGED()
+#endif	/* defined(GLES2_EXTENSION_KHR_DEBUG) */
+
+	GLES_ASSERT(ppsBufferBindingPoint != NULL);
+
+	/* Special checking code
+	   ELEMENT_ARRAY_BUFFER_INDEX : set up dirty flag if necessary
+	   UNIFORM_BUFFER_INDEX : set up dirty flag if the binding to the index buffer binding point is changed which
+	                          includes the changes of the buffer object, offset, and/or size.
+	 */
+	switch (i32TargetIndex)
+	{
+		case ELEMENT_ARRAY_BUFFER_INDEX:
+		{
+			if ((*ppsBufferBindingPoint) != psBufferObject)
+			{
+				gc->sVAOMachine.psActiveVAO->ui32DirtyState |= GLES3_DIRTYFLAG_VAO_ELEMENT_BUFFER;
+			}
+			break;
+		}
+		case UNIFORM_BUFFER_INDEX:
+		{
+			if (i32Index >= 0)
+			{
+				if ((*ppsBufferBindingPoint) != psBufferObject ||
+					(psIndexedBindingPoint->ui32Offset != ui32Offset) ||
+					(psIndexedBindingPoint->ui32Size != ui32Size))
+				{
+					ChangeUniformBufferIndexedBinding(gc, (IMG_UINT32)i32Index);
+					INDEXED_BINDING_CHANGED();
+				}
+			}
+			break;
+		}
+		case SHADER_STORAGE_BUFFER_INDEX:
+		{
+			if (i32Index >= 0)
+			{
+				if ((*ppsBufferBindingPoint) != psBufferObject ||
+					(psIndexedBindingPoint->ui32Offset != ui32Offset) ||
+					(psIndexedBindingPoint->ui32Size != ui32Size))
+				{
+					ChangeShaderStorageBufferIndexedBinding(gc, (IMG_UINT32)i32Index);
+					INDEXED_BINDING_CHANGED();
+				}
+			}
+			break;
+		}
+		case ATOMIC_COUNTER_BUFFER_INDEX:
+		{
+			if (i32Index >= 0)
+			{
+				if ((*ppsBufferBindingPoint) != psBufferObject ||
+					(psIndexedBindingPoint->ui32Offset != ui32Offset) ||
+					(psIndexedBindingPoint->ui32Size != ui32Size))
+				{
+					ChangeAtomicCountersBufferIndexedBinding(gc, (IMG_UINT32)i32Index);
+					INDEXED_BINDING_CHANGED();
+				}
+			}
+			break;
+		}
+	}
+
+	/* Decrease the reference count for the original binding */
+	if (((*ppsBufferBindingPoint) != NULL) &&
+		((*ppsBufferBindingPoint)->sNamedItem.ui32Name != 0))
+	{
+		NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)(*ppsBufferBindingPoint));
+	}
+
+	/* Install the new buffer into the correct target */
+	*ppsBufferBindingPoint = psBufferObject;
+
+	KHR_DEBUG_IF(psIndexedBindingPoint && psBufferObject && !bIndexedBindingChanged)
+	{
+		LogKHRDebugWarningForObjects(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+				KHR_DEBUG_MSG_BUFFER_RANGE_ALREADY_BOUND, psBufferObject->sNamedItem.pszLabel);
+	}
+#undef INDEXED_BINDING_CHANGED
+}
+
+/***********************************************************************************
+ Function Name      : CreateBufObjState
+ Inputs             : gc, psSharedContext
+ Outputs            : -
+ Returns            : Success
+ Description        : Initialises the buffer object state and creates/shares the name
+					  array.
+************************************************************************************/
+IMG_INTERNAL IMG_BOOL CreateBufObjState(GLES3Context *gc)
+{
+	IMG_UINT32 i;
+
+	/*
+	** Set up the buffer objects for the default buffers.
+	*/
+	for (i=0; i < GLES3_NUM_BUFOBJ_BINDINGS; i++)
+	{
+		gc->sBufferObject.psActiveBuffer[i] = NULL;
+	}
+
+	/* Set up the buffer objects indexed binding points */
+	for (i = 0; i < GLES3_NUM_INDEXED_BUFOBJ_BINDINGS; ++i)
+	{
+		IMG_INT32 i32IndexNumber, j;
+		GLES3BufferObjectIndexedBindingPoint * psIndexedBindings;
+
+		if (IsBoundToContext(i, IMG_TRUE) && GetIndexedBufferBindingPoints(gc, i, &i32IndexNumber, &psIndexedBindings))
+		{
+			for (j = 0; j < i32IndexNumber; ++j)
+			{
+				psIndexedBindings[j].psBufferObject = NULL;
+				psIndexedBindings[j].ui32Offset = psIndexedBindings[j].ui32Size = 0;
+			}
+		}
+	}
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : UnbindTransformFeedbackBufferObject
+ Inputs             : gc -
+                      pvBufName - name of the buffer object to be unbound
+					  psNamedItem - transform feedback object
+ Outputs            : -
+ Returns            : -
+ Description        : Unbind buffer object from transform feedback object buffer binding
+                      point.
+************************************************************************************/
+IMG_INTERNAL void UnbindTransformFeedbackBufferObject(GLES3Context *gc, const void *pvBufName, GLES3NamedItem *psNamedItem)
+{
+	IMG_UINT32 ui32BufName = pvBufName != NULL ? *((IMG_UINT32 *)pvBufName) : 0;
+	GLES3TransformFeedbackObject *psTFObject = (GLES3TransformFeedbackObject*)psNamedItem;
+	GLES3NamesArray *psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+	GLES3BufferObjectIndexedBindingPoint *psBufObjIndexedBindingPoint;
+	IMG_UINT32 i;
+
+	/* pvBufName means unbind happens in the free context */
+
+	/* Unbind buffer object from indexed buffer binding points in transform feedback object */
+	for (i = 0; i < GLES3_MAX_TRANSFORM_FEEDBACK_SEPARATE_ATTRIBS; ++i)
+	{
+		psBufObjIndexedBindingPoint = &(psTFObject->asTFBufferBindings[i]);
+		if ((psBufObjIndexedBindingPoint->psBufferObject != NULL) &&
+			(((pvBufName != NULL) && (psBufObjIndexedBindingPoint->psBufferObject->sNamedItem.ui32Name == ui32BufName)) ||
+			 ((pvBufName == NULL) && (psBufObjIndexedBindingPoint->psBufferObject->sNamedItem.ui32Name > 1)))
+		   )
+		{
+			NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psBufObjIndexedBindingPoint->psBufferObject);
+			psBufObjIndexedBindingPoint->psBufferObject = NULL;
+			psBufObjIndexedBindingPoint->ui32Offset = 0;
+			psBufObjIndexedBindingPoint->ui32Size = 0;
+		}
+	}
+}
+
+/***********************************************************************************
+ Function Name      : FreeBufObjState
+ Inputs             : gc
+ Outputs            : -
+ Returns            : -
+ Description        : Unbinds all buffer objects.
+					  If no other contexts are sharing the names array, will delete
+					  this also.
+************************************************************************************/
+IMG_INTERNAL void FreeBufObjState(GLES3Context *gc)
+{
+	IMG_UINT32 i;
+	GLES3NamesArray *psNamesArray;
+
+	psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+	GLES_ASSERT(psNamesArray != NULL);
+
+	/* unbind all the buffer objects from all binding points if necessary
+
+	   Note this function does not work exactly the same as in glDeleteBuffers
+	   because not all the binding points need to be processed here.
+	 */
+	for (i = 0; i < GLES3_NUM_INDEXED_BUFOBJ_BINDINGS; ++i)
+	{
+		IMG_INT32 i32IndexNumber, j;
+		GLES3BufferObjectIndexedBindingPoint * psIndexedBindings;
+
+		if (IsBoundToContext(i, IMG_TRUE) && GetIndexedBufferBindingPoints(gc, i, &i32IndexNumber, &psIndexedBindings))
+		{
+			for (j = 0; j < i32IndexNumber; ++j)
+			{
+				if (psIndexedBindings[j].psBufferObject != NULL)
+				{
+					NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)(psIndexedBindings[j].psBufferObject));
+					psIndexedBindings[j].psBufferObject = NULL;
+					psIndexedBindings[j].ui32Offset = psIndexedBindings[j].ui32Size = 0;
+				}
+			}
+		}
+		else
+		{
+			if (i == TRANSFORM_FEEDBACK_BUFFER_INDEX)
+			{
+				/* Unbind buffer object from all transform feedback objects buffer binding points */
+				if (gc->apsNamesArray[GLES3_NAMETYPE_TFOBJ - GLES3_MAX_SHAREABLE_NAMETYPE] != NULL)
+				{
+					NamesArrayMapFunction(gc, gc->apsNamesArray[GLES3_NAMETYPE_TFOBJ - GLES3_MAX_SHAREABLE_NAMETYPE], UnbindTransformFeedbackBufferObject, NULL);
+				}
+				if (gc->sTFOMachine.psDefaultTFObject != NULL)
+				{
+					UnbindTransformFeedbackBufferObject(gc, NULL, &(gc->sTFOMachine.psDefaultTFObject->sNamedItem));
+				}
+			}
+		}
+	}
+
+	for (i=0; i < GLES3_NUM_BUFOBJ_BINDINGS; i++)
+	{
+		if (gc->sBufferObject.psActiveBuffer[i])
+		{
+		    /* Only decrease VBO & PBO's refCount by 1,
+			   since only VBO & PBO can be bound to the context, while IBO can only be bound to VAO */
+			if(IsBoundToContext(i, IMG_FALSE))
+			{
+				NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)gc->sBufferObject.psActiveBuffer[i]);
+			}
+			gc->sBufferObject.psActiveBuffer[i] = NULL;
+		}
+	}
+}
+
+/***********************************************************************************
+ Function Name      : CreateBufferObject
+ Inputs             : gc, ui32Name, ui32Target
+ Outputs            : -
+ Returns            : Pointer to new buffer object structure
+ Description        : Creates and initialises a new buffer object structure.
+************************************************************************************/
+IMG_INTERNAL GLES3NamedItem *CreateBufferObject(GLES3Context *gc, IMG_UINT32 ui32Name, IMG_UINT32 ui32Target)
+{
+	GLES3BufferObject *psBufObj;
+	IMG_INT32 i32TargetIndex = (IMG_INT32)ui32Target;
+
+	PVR_UNREFERENCED_PARAMETER(gc);
+
+	psBufObj = (GLES3BufferObject *) GLES3Calloc(sizeof(GLES3BufferObject));
+
+	if (psBufObj)
+	{
+		psBufObj->sNamedItem.ui32Name	= ui32Name;
+
+		/* init the buffer object state */
+		psBufObj->i32Index				= i32TargetIndex;
+		psBufObj->eUsage				= GL_STATIC_DRAW;
+		psBufObj->ui32BufferSize		= 0;
+		psBufObj->sAllocAlign			= 0;
+		psBufObj->eAccess				= GL_WRITE_ONLY_OES;
+		psBufObj->bMapped				= IMG_FALSE;
+		psBufObj->bMappedNonPersistent	= IMG_FALSE;
+		psBufObj->pvBufferMapPointer	= NULL;
+		psBufObj->ui32BufferMapOffset	= 0;
+		psBufObj->ui32BufferMapLength	= 0;
+		psBufObj->ui32AccessFlags		= 0;
+		psBufObj->ui32MapOPFlag			= 0;
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+		psBufObj->bImmutable			= IMG_FALSE;
+		psBufObj->ui32StorageFlags		= 0;
+#endif
+		psBufObj->psMemInfo				= NULL;
+		psBufObj->pvCpuVirtAddr			= NULL;
+		psBufObj->psBackupMemInfo		= NULL;
+		psBufObj->pvBackupCpuVirtAddr	= NULL;
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL) || defined(GLES31_EXTENSION_MEMORY_OBJECT)
+		psBufObj->bExternal				= IMG_FALSE;
+#endif
+
+		/* Clear use method flag */
+		psBufObj->ui32UseMethodFlag		= 0;
+
+		RM_InitialiseResource(gc->psSysContext->psRM, RM_CONTEXT_OPENGLES3, gc->ui32ContextID, &psBufObj->sRMResource, RM_RTYPE_BUFOBJ, ui32Name);
+		RM_InitialiseResource(gc->psSysContext->psRM, RM_CONTEXT_OPENGLES3, gc->ui32ContextID, &psBufObj->sRMBackupResource, RM_RTYPE_BUFOBJB, ui32Name);
+	}
+
+	return (GLES3NamedItem *)psBufObj;
+}
+
+
+IMG_INTERNAL void DestroyBufferObjectGhostRM(void *pvContext, RMResource *psResource)
+{
+	/* Note the tricky pointer arithmetic. It is necessary */
+	GLES3BufferObjectGhost *psBufObjGhost = (GLES3BufferObjectGhost *)((uintptr_t)psResource -offsetof(GLES3BufferObjectGhost, sRMResource));
+	GLES3Context *gc = (GLES3Context *)pvContext;
+
+	if(psBufObjGhost->psMemInfo)
+	{
+		/* The ghost's CPU mapping was released before being added to the KRM */
+		GLES3FREEDEVICEMEM(psBufObjGhost->psMemInfo);
+	}
+
+	RM_ClearResource(gc->psSysContext->psRM, psResource);
+	RM_FreeResource(gc->psSysContext->psRM, psResource);
+
+	GLES3Free(psBufObjGhost);
+}
+
+
+/***********************************************************************************
+ Function Name      : FreeBufferObject
+ Inputs             : gc, psBufObj
+ Outputs            : -
+ Returns            : -
+ Description        : Frees all structures/data associated with a buffer object
+************************************************************************************/
+IMG_INTERNAL void FreeBufferObject(GLES3Context *gc, GLES3BufferObject *psBufObj, IMG_BOOL bIsShutdown)
+{
+	PVR_UNREFERENCED_PARAMETER(bIsShutdown);
+	GLES_ASSERT(bIsShutdown || (psBufObj->sNamedItem.ui32RefCount == 0));
+
+	/* No need to detach bufobj from any referenced pointer:
+	   if a draw call refers to any deleted bufobj,
+	   then the result is undefined, mostly crashed. And this is expected */
+
+	/* Free its device memory */
+	if (psBufObj->psMemInfo)
+	{
+		KHR_DEBUG_IF(RM_IsResourceNeeded(gc->psSysContext->psRM, &psBufObj->sRMResource, RM_USAGE_READ_WRITE))
+		{
+			LogKHRDebugWarningForObjects(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+					KHR_DEBUG_MSG_BUFFER_DELETED_WHILE_IN_USE, psBufObj->sNamedItem.pszLabel);
+		}
+
+		if(!WaitForBufferObjectValidForChange(gc, psBufObj, 0, NULL))
+		{
+			PVR_DPF((PVR_DBG_ERROR,"FreeBufferObject: Problem freeing buffer object"));
+		}
+
+		/* Remove from the resource manager */
+		RM_ClearResource(gc->psSysContext->psRM, &psBufObj->sRMResource);
+		RM_FreeResource(gc->psSysContext->psRM, &psBufObj->sRMResource);
+
+		/* This if test is necessary as WaitForBufferObjectValidForChange above does not
+		   keep content (bKeepContent = IMG_FALSE).
+		 */
+		if (psBufObj->psMemInfo != NULL)
+		{
+		    RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufObj->sRMBackupResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+
+		    if (psBufObj->pvCpuVirtAddr)
+			{
+				PVRSRVReleaseCPUMapping(psBufObj->psMemInfo->hMemDesc);
+				psBufObj->pvCpuVirtAddr = NULL;
+			}
+
+#if defined(PDUMP)
+			PDumpStringContinuous(gc, "FreeBufferObject meminfo "IMG_DEV_VIRTADDR_FMTSPEC" size "IMG_DEV_VIRTADDR_FMTSPEC"\n",psBufObj->psMemInfo->sDevVirtAddr.uiAddr, psBufObj->psMemInfo->uiAllocationSize);
+#endif
+
+			RMLog(gc->psSysContext->psRM, RM_LL_RESOURCE, RM_LOG_RESOURCEF " FREE BufferObject meminfo "IMG_DEV_VIRTADDR_FMTSPEC" size "IMG_DEV_VIRTADDR_FMTSPEC"\n",
+					RM_LOG_RESOURCE((&psBufObj->sRMResource)), psBufObj->psMemInfo->sDevVirtAddr.uiAddr, psBufObj->psMemInfo->uiAllocationSize);
+
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL) || defined(GLES31_EXTENSION_MEMORY_OBJECT)
+			if(psBufObj->bExternal)
+			{
+				/* We don't want to release the underlying device memory, only the CPU-side mapping. */
+				GLES3Free(psBufObj->psMemInfo);
+			}
+			else
+#endif
+			{
+				GLES3FREEDEVICEMEM(psBufObj->psMemInfo);
+			}
+		}
+	}
+	else
+	{
+		GLES_ASSERT(psBufObj->pvCpuVirtAddr == NULL);
+
+		/* Remove from the resource manager */
+		RM_ClearResource(gc->psSysContext->psRM, &psBufObj->sRMResource);
+		RM_FreeResource(gc->psSysContext->psRM, &psBufObj->sRMResource);
+	}
+
+	GLES_ASSERT(psBufObj->psBackupMemInfo == NULL);
+	GLES_ASSERT(psBufObj->pvBackupCpuVirtAddr == NULL);
+	RM_ClearResource(gc->psSysContext->psRM, &psBufObj->sRMBackupResource);
+	RM_FreeResource(gc->psSysContext->psRM, &psBufObj->sRMBackupResource);
+
+	GLES3Free(psBufObj);
+}
+
+/***********************************************************************************
+ Function Name      : DisposeBufObject
+ Inputs             : gc, psItem, bIsShutdown
+ Outputs            : -
+ Returns            : -
+ Description        : Generic buffer object free function; called from names.c
+***********************************************************************************/
+static void DisposeBufObject(GLES3Context *gc, GLES3NamedItem *psItem, IMG_BOOL bIsShutdown)
+{
+	GLES3BufferObject *psBufObj = (GLES3BufferObject *)psItem;
+
+	FreeBufferObject(gc, psBufObj, bIsShutdown);
+}
+
+/***********************************************************************************
+ Function Name      : SetupBufObjNameArray
+ Inputs             : psNamesArray
+ Outputs            : -
+ Returns            : -
+ Description        : Sets up names array for buffer objects.
+************************************************************************************/
+IMG_INTERNAL void SetupBufObjNameArray(GLES3NamesArray *psNamesArray)
+{
+	psNamesArray->pfnFree  = DisposeBufObject;
+}
+
+/***********************************************************************************
+ Function Name      : BindBuffer
+ Inputs             : gc, i32TargetIndex, buffer, bBindRange, offset, size
+ Outputs            : -
+ Returns            : Pointer to a buffer object structure
+ Description        : Bind a buffer object to general binding point. If the buffer
+                      object is bound the first time, create it.
+					  Offset and size is used when checking the bind range is needed.
+************************************************************************************/
+static GLES3BufferObject* BindBuffer(GLES3Context *gc, IMG_INT32 i32TargetIndex,
+									  GLuint buffer)
+{
+	GLES3NamesArray *psNamesArray;
+	GLES3BufferObject *psBufObj = NULL;
+	GLES3BufferObject **ppsBufferBindingPoint;
+
+	IF_UNLIKELY (i32TargetIndex == -1)
+	{
+		/* Not support buffer object target */
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    "glBindBuffer: target is not an accepted value");
+		return NULL;
+	}
+
+	psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+	GLES_ASSERT(psNamesArray != NULL);
+
+	/* Get the general buffer binding point */
+	ppsBufferBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+	IF_UNLIKELY (ppsBufferBindingPoint == NULL)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glBindBuffer: target is not an accepted value");
+		return NULL;
+	}
+
+	if (buffer)
+	{
+		/* Retrieve the NamedItem if present in the NamesArray,
+		 * Create a new NamedItem and Insert it if not present.
+		 * This would also increment the RefCount */
+		psBufObj = (GLES3BufferObject *) RetrieveOrInsertNamedItem(gc, psNamesArray,
+																   buffer,
+																   (IMG_UINT32)i32TargetIndex,
+																   CreateBufferObject);
+		IF_UNLIKELY (!psBufObj)
+		{
+			/* Either there was a failure to Create a New Buffer Object, or
+			 * a failure to insert the newly Created NamedItem into the NamesArray.
+			 * For both the cases, we return a GL_OUT_OF_MEMORY */
+			PVR_DPF((PVR_DBG_ERROR, "BindBuffer: Failed to Create Buffer Object or, to insert it into NamesArray"));
+			SetErrorWithMessage(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, "glBindBuffer: not enough memory to create buffer object");
+			return NULL;
+		}
+
+		/*
+		 * Most probably we must have retrieved an existing Buffer object.
+		 * Better to do a sanity check in any case.
+		 */
+		GLES_ASSERT(buffer == psBufObj->sNamedItem.ui32Name);
+
+		/* Assign eIndex value */
+		psBufObj->i32Index = i32TargetIndex;
+
+		/* Check whether the requested Buffer Object is already bound to the Target */
+		KHR_DEBUG_IF(*ppsBufferBindingPoint && (*ppsBufferBindingPoint)->sNamedItem.ui32Name == buffer)
+		{
+			LogKHRDebugWarningForObjects(gc, TYPE_PERFORMANCE, SEVERITY(MEDIUM), "",
+					KHR_DEBUG_MSG_BUFFER_ALREADY_BOUND, psBufObj->sNamedItem.pszLabel);
+		}
+	}
+
+	/* Assign the new buffer object to this buffer binding point */
+	AssignBufferToBindingPoint(gc, i32TargetIndex, psNamesArray, psBufObj, ppsBufferBindingPoint, -1, NULL, 0, 0);
+
+	return psBufObj;
+}
+
+/***********************************************************************************
+ Function Name      : BindBufferRange
+ Inputs             : gc, i32TargetIndex, buffer, bWholeRange, offset, size
+ Outputs            : -
+ Returns            : Pointer to a buffer object structure
+ Description        : Bind a buffer object to general binding point, as well as
+                      index binding point. If the buffer object is bound the first
+					  time, create it.
+					  Offset and size is used when only the partial range of the
+					  buffer is bound.
+************************************************************************************/
+static GLES3BufferObject * BindBufferRange(GLES3Context *gc, IMG_INT32 i32TargetIndex,
+										   GLuint index,
+										   GLuint buffer,
+										   IMG_BOOL bOffset, GLintptr offset,
+										   IMG_BOOL bSize, GLsizeiptr size)
+{
+	IMG_INT32 i32IndexNumber;
+	GLES3BufferObject *psBufObj = NULL;
+	GLES3BufferObject **ppsBufferBindingPoint;
+	GLES3BufferObjectIndexedBindingPoint *psIndexedBindingPoint;
+	GLES3NamesArray *psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+
+	if (i32TargetIndex == -1)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    		"glBindBufferRange: target is not an accepted value");
+		return NULL;
+	}
+
+	/* Check if target is the valid indexed target.
+	   If it is, get the number of supported indices and the array of the indexed bindings.
+	 */
+	if (!GetIndexedBufferBindingPoints(gc, i32TargetIndex, &i32IndexNumber, &psIndexedBindingPoint))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+			            	"glBindBufferRange: target is not a valid indexed target");
+		return NULL;
+	}
+
+	/* check index */
+	if (index >= (IMG_UINT32)i32IndexNumber)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+				    		"glBindBufferRange: index is an invalid value");
+		return NULL;
+	}
+
+	if (buffer != 0)
+    {
+        /* Saint checks against Spec for offset and size */
+        if (bOffset && (offset < 0))
+        {
+			SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+								"glBindBufferRange: buffer is not zero and offset is less than or equal to zero");
+		    return NULL;
+        }
+
+	    if (bSize && (size <= 0))
+	    {
+			SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+								"glBindBufferRange: buffer is not zero and size is less than or equal to zero");
+		    return NULL;
+	    }
+
+	    if (i32TargetIndex == TRANSFORM_FEEDBACK_BUFFER_INDEX)
+	    {
+		    if ((gc->sTFOMachine.psActiveTFObject != NULL) &&
+			    (gc->sTFOMachine.psActiveTFObject->bActive))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_TRANSFORM_FEEDBACK_BUFFER and Transform Feedback"
+									" is active");
+			    return NULL;
+		    }
+
+		    if ((bOffset && ((offset % 4) != 0)) ||
+			    (bSize && ((size <= 0) || ((size % 4) != 0))))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_TRANSFORM_FEEDBACK_BUFFER and size or offset"
+									" are not multiples of 4");
+			    return NULL;
+		    }
+	    }
+	    else if (i32TargetIndex == UNIFORM_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % GLES3_UNIFORM_BUFFER_OFFSET_ALIGNMENT) != 0))
+		    {
+			    SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_UNIFORM_BUFFER and offset is not a multiple"
+									" of GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT");
+			    return NULL;
+		    }
+	    }
+	    else if (i32TargetIndex == SHADER_STORAGE_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % GLES3_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT) != 0))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_SHADER_STORAGE_BUFFER and offset is not a"
+									" multiple of GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT");
+			    return NULL;
+		    }
+	    }
+	    else if (i32TargetIndex == ATOMIC_COUNTER_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % GLES3_ATOMIC_COUNTER_BUFFER_OFFSET_ALIGNMENT) != 0))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_ATOMIC_COUNTER_BUFFER and offset is not a"
+									" multiple of GL_ATOMIC_COUNTER_BUFFER_OFFSET_ALIGNMENT");
+			    return NULL;
+		    }
+	    }
+#if defined(GLES3_EXTENSION_TEXTURE_BUFFER)
+	    else if(i32TargetIndex == TEXTURE_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % GLES3_TEXTURE_BUFFER_OFFSET_ALIGNMENT) != 0))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: target is GL_TEXTURE_BUFFER and offset is not a"
+									" multiple of GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT");
+			    return NULL;
+		    }
+	    }
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_BUILD_BUFFER_OBJECT)
+	    else if(i32TargetIndex == COMPONENT_BUILD_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % 8) != 0))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: bad offset");
+			    return NULL;
+		    }
+	    }
+#endif
+#if defined(GLES31_EXTENSION_COMPONENT_GROUP_MERGE_BUFFER_OBJECT)
+	    else if(i32TargetIndex == COMPONENT_GROUP_MERGE_BUFFER_INDEX)
+	    {
+		    if (bOffset && ((offset % 8) != 0))
+		    {
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+									"glBindBufferRange: bad offset");
+			    return NULL;
+		    }
+	    }
+#endif
+		/* Retrieve the NamedItem if present in the NamesArray,
+		 * Create a new NamedItem and Insert it if not present.
+		 * This would also increment the RefCount */
+		psBufObj = (GLES3BufferObject *) RetrieveOrInsertNamedItem(gc, psNamesArray,
+																   buffer,
+																   (IMG_UINT32)i32TargetIndex,
+																   CreateBufferObject);
+		if (!psBufObj)
+		{
+			/* Either there was a failure to Create a New Buffer Object, or
+			 * a failure to insert the newly Created NamedItem into the NamesArray.
+			 * For both the cases, we return a GL_OUT_OF_MEMORY */
+			PVR_DPF((PVR_DBG_ERROR, "BindBufferRange: Failed to Create Buffer Object or, to insert it into NamesArray"));
+
+			SetErrorWithMessage(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+								"glBindBufferRange: not enough memory to create buffer object");
+
+			return NULL;
+		}
+
+		/*
+		 * Most probably we must have retrieved an existing Buffer object.
+		 * Better to do a sanity check in any case.
+		 */
+		GLES_ASSERT(buffer == psBufObj->sNamedItem.ui32Name);
+
+		NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psBufObj);
+	}
+
+	/* Adjust the offset and size */
+    if (psBufObj != NULL)
+	{
+	    if (!bOffset)
+	    {
+		    offset = 0;
+	    }
+
+	    if (!bSize)
+	    {
+		    size = (psBufObj->ui32BufferSize - offset);
+	    }
+	}
+	else
+	{
+		offset = 0;
+		size = 0;
+	}
+
+	/* Bind buffer to general buffer binding point:
+	   1) Get the general buffer binding point
+	   2) Increase the ref count in order to bind to the general buffer binding point
+	   2) Assign the new buffer object to this buffer binding point
+	 */
+	ppsBufferBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+	if (ppsBufferBindingPoint == NULL)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    		"glBindBufferRange: target is not an accepted value");
+		return NULL;
+	}
+	if (psBufObj != NULL)
+	{
+		NamedItemAddRef(psNamesArray, psBufObj->sNamedItem.ui32Name);
+	}
+	AssignBufferToBindingPoint(gc, i32TargetIndex, psNamesArray, psBufObj, ppsBufferBindingPoint, -1, NULL, 0, 0);
+
+	/* Increase the ref count in order to bind to the index buffer binding point */
+	if (psBufObj != NULL)
+	{
+		NamedItemAddRef(psNamesArray, psBufObj->sNamedItem.ui32Name);
+	}
+	/* Assign the new buffer object to the specified index buffer binding point */
+	AssignBufferToBindingPoint(gc, i32TargetIndex, psNamesArray, psBufObj, &(psIndexedBindingPoint[index].psBufferObject),
+							   index, &(psIndexedBindingPoint[index]), offset, size);
+
+	/* Set the offset and size */
+	psIndexedBindingPoint[index].ui32Offset = (IMG_UINT32)offset;
+	psIndexedBindingPoint[index].ui32Size = (IMG_UINT32)size;
+	psIndexedBindingPoint[index].bOffsetSet = bOffset;
+	psIndexedBindingPoint[index].bSizeSet = bSize;
+
+	return psBufObj;
+}
+
+/***********************************************************************************
+ Function Name      : glBindBuffer
+ Inputs             : target, buffer
+ Outputs            : -
+ Returns            : -
+ Description        : Sets current buffer object for subsequent calls.
+					  Will create an internal psBufObj structure, but no buffer data
+					  memory is allocated yet. Uses name table.
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glBindBuffer(GLenum target, GLuint buffer)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBindBuffer"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBindBuffer);
+
+	BindBuffer(gc, GetBufferIndexFromTarget(target), buffer);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBindBuffer);
+}
+
+/***********************************************************************************
+ Function Name      : glBindBufferRange
+ Inputs             : target, index, buffer, offset, size
+ Outputs            : -
+ Returns            : -
+ Description        : Sets current buffer object for subsequent calls, as well as
+                      the index buffer binding point.  Uses name table.
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBindBufferRange"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBindBufferRange);
+
+	BindBufferRange(gc, GetBufferIndexFromTarget(target), index, buffer, IMG_TRUE, offset, IMG_TRUE, size);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBindBufferRange);
+}
+
+/***********************************************************************************
+ Function Name      : glBindBufferOffset
+ Inputs             : target, index, buffer
+ Outputs            : -
+ Returns            : -
+ Description        : Sets current buffer object for subsequent calls, as well as
+                      the index buffer binding point.  Uses name table.
+************************************************************************************/
+/*
+GL_APICALL void GL_APIENTRY glBindBufferOffset(GLenum target, GLuint index, GLuint buffer, GLintptr offset)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBindBufferOffset"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBindBufferOffset);
+
+	BindBufferRange(gc, GetBufferIndexFromTarget(target), index, buffer, IMG_TRUE, offset, IMG_FALSE, 0);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBindBufferOffset);
+}
+*/
+
+/***********************************************************************************
+ Function Name      : glBindBufferBase
+ Inputs             : target, index, buffer
+ Outputs            : -
+ Returns            : -
+ Description        : Sets current buffer object for subsequent calls, as well as
+                      the index buffer binding point.  Uses name table.
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glBindBufferBase(GLenum target, GLuint index, GLuint buffer)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBindBufferBase"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBindBufferBase);
+
+	BindBufferRange(gc, GetBufferIndexFromTarget(target), index, buffer, IMG_FALSE, 0, IMG_FALSE, 0);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBindBufferBase);
+}
+
+/***********************************************************************************
+ Function Name      : UnbindVAOBufferObject
+ Inputs             : gc -
+                      ui32BufName - name of the buffer object to be unbound
+ Outputs            : -
+ Returns            : -
+ Description        : Unbind buffer object from VAO
+************************************************************************************/
+static void UnbindVAOBufferObject(GLES3Context *gc, IMG_UINT32 ui32BufName)
+{
+	GLES3VertexArrayObject *psVAO;
+	GLES3NamesArray *psNamesArray;
+	IMG_UINT32 i;
+	GLES3BufferObject *psBufObj;
+
+	psVAO = gc->sVAOMachine.psActiveVAO;
+	GLES_ASSERT(VAO(gc));
+
+	psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+
+	/*
+	* If the buffer object is currently bound to the VAO's attribute pointer, bind 0 to its target.
+	*/
+	for (i=0; i < GLES3_MAX_VERTEX_ATTRIBS; i++)
+	{
+		psBufObj = psVAO->asBufferBindingState[i].psBufObj;
+
+		/* Is the buffer object currently bound to the VAO? Unbind it */
+		if (psBufObj && psBufObj->sNamedItem.ui32Name == ui32BufName)
+		{
+			/* Decrease RefCount by 1 when unbinding it from the VAO */
+			NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psBufObj);
+
+			psVAO->asBufferBindingState[i].psBufObj = NULL;
+
+			/* Mark as dirty so we will spot the unbind if someone tries to draw with it */
+			psVAO->ui32DirtyState |= GLES3_DIRTYFLAG_VAO_ATTRIB_STREAM;
+		}
+	}
+
+	/*
+	* If the buffer object is currently bound to the VAO's element buffer pointer, bind 0 to its target.
+	*/
+	psBufObj = psVAO->psBoundElementBuffer;
+
+	if (psBufObj && psBufObj->sNamedItem.ui32Name == ui32BufName)
+	{
+		/* Decrease RefCount by 1 when unbinding it from the VAO */
+		NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psBufObj);
+
+		psVAO->psBoundElementBuffer = NULL;
+
+		psVAO->ui32DirtyState |= GLES3_DIRTYFLAG_VAO_ELEMENT_BUFFER;
+	}
+}
+
+/***********************************************************************************
+ Function Name      : DereferenceFromNonContextBufferBindingPoints
+ Inputs             : gc -
+                      psBufObj -
+ Outputs            : -
+ Returns            : -
+ Description        : Unbind buffer object from all non-context based buffer
+                      binding points
+************************************************************************************/
+static void DereferenceFromNonContextBufferBindingPoints(GLES3Context *gc, IMG_UINT32 ui32BufferName)
+{
+	/* Unbind buffer object from VAO buffer binding points */
+	UnbindVAOBufferObject(gc, ui32BufferName);
+}
+
+/***********************************************************************************
+ Function Name      : glDeleteBuffers
+ Inputs             : n, buffers
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Deletes a list of n buffers.
+					  Deletes internal psBufObj structures for named buffer objects
+					  and if they were currently bound, binds 0 (disabled b/o).
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glDeleteBuffers(GLsizei n, const GLuint *buffers)
+{
+	GLES3BufferObject *psBufObj;
+	GLES3NamesArray *psNamesArray;
+	IMG_INT32       i, j, k;
+	IMG_INT32		i32IndexNumber;
+	GLES3BufferObjectIndexedBindingPoint *psIndexedBindings;
+
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glDeleteBuffers"));
+
+	GLES3_TIME_START(GLES3_TIMES_glDeleteBuffers);
+
+	if (n < 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+				    "glDeleteBuffers: n is negative, which is an invalid value");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glDeleteBuffers);
+
+		return;
+	}
+
+	psNamesArray = gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ];
+
+	for (i=0; i < n; i++)
+	{
+		if (buffers[i] != 0)
+		{
+			/* Deleting a buffer object requires decrease its refcounts from all binding points (every time
+			   a buffer object is bound to one of these binding point, its reference count is increased by
+			   one), which includes
+			     1. Context based general binding point
+				 2. Context based indexed binding points
+				 3. Non-Context based binding points
+			 */
+
+			/* Dereference from indexed buffer binding point for currently bound container objects / context binding points */
+			for (j = 0; j < GLES3_NUM_INDEXED_BUFOBJ_BINDINGS; ++j)
+			{
+				if (GetIndexedBufferBindingPoints(gc, j, &i32IndexNumber, &psIndexedBindings))
+				{
+					for (k = 0; k < i32IndexNumber; ++k)
+					{
+						psBufObj = psIndexedBindings[k].psBufferObject;
+						if ((psBufObj != NULL) && (psBufObj->sNamedItem.ui32Name == buffers[i]))
+						{
+							NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psIndexedBindings[k].psBufferObject);
+							psIndexedBindings[k].psBufferObject = NULL;
+							psIndexedBindings[k].ui32Offset = psIndexedBindings[k].ui32Size = 0;
+						}
+					}
+				}
+			}
+
+			/* Dereference from context based general buffer binding point */
+			for (j=0; j < GLES3_NUM_BUFOBJ_BINDINGS; j++)
+			{
+				if (IsBoundToContext(j, IMG_FALSE))
+				{
+					psBufObj = gc->sBufferObject.psActiveBuffer[j];
+					if (psBufObj && psBufObj->sNamedItem.ui32Name == buffers[i])
+					{
+						NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)gc->sBufferObject.psActiveBuffer[j]);
+						gc->sBufferObject.psActiveBuffer[j] = NULL;
+					}
+				}
+			}
+
+			/* Dereference from other buffer binding points, e.g., object based buffer binding point */
+			DereferenceFromNonContextBufferBindingPoints(gc, buffers[i]);
+
+
+#if defined(GLES3_EXTENSION_TEXTURE_BUFFER)
+
+			/* Unbind buffer object and texture, decrease the refcount of buffer object */
+			psBufObj = (GLES3BufferObject *) NamedItemAddRef(psNamesArray, buffers[i]);
+
+			if(psBufObj)
+			{
+				while (psBufObj->psBufferTextureList)
+				{
+					GLES3Texture* psHeadOfTexList = psBufObj->psBufferTextureList->psTexture;
+					DetachTextureAndBufferObject(gc, psBufObj, psHeadOfTexList);
+				}
+
+				NamedItemDelRef(gc, psNamesArray, (GLES3NamedItem*)psBufObj);
+			}
+#endif
+		}
+
+	}
+
+	/* Finally, decrement the refcount of all of them */
+	NamedItemDelRefByName(gc, psNamesArray, (IMG_UINT32)n, (const IMG_UINT32 *)buffers);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glDeleteBuffers);
+}
+
+
+/***********************************************************************************
+ Function Name      : glGenBuffers
+ Inputs             : n
+ Outputs            : buffers
+ Returns            : -
+ Description        : ENTRYPOINT: Generates a set of n names for buffer objects
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glGenBuffers(GLsizei n, GLuint *buffers)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glGenBuffers"));
+
+	GLES3_TIME_START(GLES3_TIMES_glGenBuffers);
+
+	if (n < 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+				    "glGenBuffers: n is negative, which is an invalid value");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glGenBuffers);
+		return;
+	}
+
+	NamesArrayGenNames(gc->psSharedState->apsNamesArray[GLES3_NAMETYPE_BUFOBJ], (IMG_UINT32)n, (IMG_UINT32 *)buffers);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glGenBuffers);
+}
+
+/***********************************************************************************
+ Function Name      : AllocStagingBuffer
+ Inputs             : gc, psStagingBuffer, uiSize
+ Outputs            : -
+ Returns            : IMG_TRUE if successfully allocated staging buffer, otherwise
+                      IMG_FALSE
+ Description        : Allocate staging buffer used for uploading data to buffer
+                      storage when no cpu mapability was requested
+***********************************************************************************/
+static IMG_BOOL AllocStagingBuffer(
+	GLES3Context* gc,
+	GLES3BufferStorageStagingBuffer* psStagingBuffer,
+	IMG_UINT32 uiSize
+)
+{
+	IMG_UINT32 uiAllocFlags;
+	IMG_UINT32 i = 0;
+	IMG_UINT32 NumPhysicalPages = (uiSize >> g_ui32Log2DevicePageSize) + 1;
+	/* Prepare 100mb of virtual space so that the buffer can grow over time */
+	IMG_UINT32 NumVirtualPages = (PVRSRV_1M_PAGE_SIZE * 100) >> g_ui32Log2DevicePageSize;
+	IMG_BOOL *pbUsedPageMap = GLES3Calloc(NumVirtualPages * sizeof(*pbUsedPageMap));
+
+	if (!pbUsedPageMap)
+	{
+		return IMG_FALSE;
+	}
+
+	uiAllocFlags = PVRSRV_MEMALLOCFLAG_GPU_READABLE
+		| PVRSRV_MEMALLOCFLAG_GPU_WRITEABLE
+		| gc->ui32DevmemCacheAllocFlagsGPU
+		| PVRSRV_MEMALLOCFLAG_CPU_READABLE
+		| PVRSRV_MEMALLOCFLAG_CPU_WRITEABLE
+		| gc->ui32DevmemCacheAllocFlagsCPU;
+
+	psStagingBuffer->uiSize = NumPhysicalPages << g_ui32Log2DevicePageSize;
+
+	for (; i < NumPhysicalPages; ++i)
+	{
+		pbUsedPageMap[i] = IMG_TRUE;
+	}
+
+	if(GLES3ALLOCDEVICEMEMSPARSE(
+		gc->psSysContext->hGeneralHeap,
+		gc->psSysContext->hDevMemContext,
+		uiAllocFlags,
+		ROGUE_CACHE_LINE_SIZE,	/* Alignment */
+		1 << g_ui32Log2DevicePageSize,	/* PageSize */
+		NumVirtualPages,
+		NumPhysicalPages,
+		pbUsedPageMap,
+		"glBufferStorageEXT stage mem for data copy",
+		&psStagingBuffer->psMemInfo) != PVRSRV_OK
+	)
+	{
+		psStagingBuffer->uiSize = 0;
+		psStagingBuffer->psMemInfo = NULL;
+		GLES3Free(pbUsedPageMap);
+
+		return IMG_FALSE;
+	}
+
+	RM_InitialiseResource(gc->psSysContext->psRM, RM_CONTEXT_OPENGLES3, gc->ui32ContextID, &psStagingBuffer->sResource, RM_RTYPE_STAGING, 0);
+	GLES3Free(pbUsedPageMap);
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : GrowStagingBuffer
+ Inputs             : gc, psStagingBuffer, uiSize
+ Outputs            : -
+ Returns            : IMG_TRUE if successfully grown staging buffer, otherwise
+                      IMG_FALSE
+ Description        : Grow staging buffer used for uploading data to buffer
+                      storage when no cpu mapability was requested. It is the
+                      callers responsibility to check if grow is necessary and pass
+                      valid uiSize (ie larger than current size of staging buffer)
+***********************************************************************************/
+static IMG_BOOL GrowStagingBuffer(
+	GLES3Context* gc,
+	GLES3BufferStorageStagingBuffer* psStagingBuffer,
+	IMG_UINT32 uiSize
+)
+{
+#define SMALL_GROW 16
+	IMG_UINT32 i;
+
+	IMG_UINT32 uiAdditionalSpace = uiSize - psStagingBuffer->uiSize;
+	IMG_UINT32 uiNumAdditionalPages = (uiAdditionalSpace >> g_ui32Log2DevicePageSize) + 1;
+	SPARSE_MEM_RESIZE_FLAGS uiFlags = SPARSE_RESIZE_ALLOC;
+	IMG_UINT32 auiSmallAllocIndices[SMALL_GROW];
+	IMG_UINT32 uiCurrentPageIndex = psStagingBuffer->uiSize >> g_ui32Log2DevicePageSize;
+
+	IMG_UINT32 *puiAllocIndices =
+		uiNumAdditionalPages <= SMALL_GROW ? auiSmallAllocIndices :
+			GLES3Malloc(uiNumAdditionalPages * sizeof(*puiAllocIndices));
+
+	if (!puiAllocIndices)
+	{
+		return IMG_FALSE;
+	}
+
+	PVR_UNREFERENCED_PARAMETER(gc);
+
+	for (i = 0; i < uiNumAdditionalPages; ++i)
+	{
+		puiAllocIndices[i] = uiCurrentPageIndex + i;
+	}
+
+#if !defined(PVRSRV_UNMAP_ON_SPARSE_CHANGE) && !defined(PVRSRV_NO_MEMINFO_CPU_VIRT_ADDR)
+	uiFlags |= SPARSE_MAP_CPU_ADDR;
+#endif
+
+	if (PVRSRVChangeSparseDeviceMemMIW(
+		psStagingBuffer->psMemInfo,
+		uiNumAdditionalPages,
+		puiAllocIndices,
+		0,
+		NULL,
+		uiFlags) != PVRSRV_OK
+	)
+	{
+		if (uiNumAdditionalPages > SMALL_GROW)
+			GLES3Free(puiAllocIndices);
+
+		return IMG_FALSE;
+	}
+
+	if (uiNumAdditionalPages > SMALL_GROW)
+		GLES3Free(puiAllocIndices);
+
+	psStagingBuffer->uiSize += uiNumAdditionalPages << g_ui32Log2DevicePageSize;
+	return IMG_TRUE;
+}
+
+#if defined(PDUMP)
+/***********************************************************************************
+Function Name      : PDumpBufferObjectDataStore
+Inputs             : gc, psBufferObject
+Outputs            : -
+Returns            : -
+Description        : PDump buffer data store
+************************************************************************************/
+static void PDumpBufferObjectDataStore(GLES3Context *gc, GLES3BufferObject *psBufObject, IMG_BOOL bIsUnmap)
+{
+    if (PDUMP_ISCAPTURING(gc) && psBufObject->psMemInfo)
+    {
+        if (psBufObject->bRequirePDumpPol)
+        {
+            PDUMP_STRING((gc, "Require pol for dump buffer content given by client correctly\n"));
+
+            RM_PDumpWaitForResourceOnHWQueue(gc->psSysContext->psRM, gc->psSysContext->psHWQueue_TQ, &psBufObject->sRMResource, 0);
+
+            psBufObject->bRequirePDumpPol = IMG_FALSE;
+        }
+
+        PDUMP_STRING_ONCE((gc, "Dumping buffer object %d at device virtual address 0x%010llx\n",
+        	psBufObject->sNamedItem.ui32Name,
+            (unsigned long long)psBufObject->psMemInfo->sDevVirtAddr.uiAddr));
+
+        if(bIsUnmap)
+        {
+            PDUMP_MEM_ONCE(gc, psBufObject->psMemInfo, psBufObject->ui32BufferMapOffset, psBufObject->ui32BufferMapLength);
+        }
+        else
+        {
+            PDUMP_MEM_ONCE(gc, psBufObject->psMemInfo, 0, psBufObject->psMemInfo->uiAllocationSize);
+        }
+    }
+}
+#endif
+
+static IMG_BOOL AllocateBufferStorage(
+	GLES3Context *gc,
+	GLES3BufferObject *psBufObject,
+	GLsizeiptr size,
+	IMG_UINT32 ui32AllocSize,
+	IMG_DEVMEM_ALIGN_T sAllocAlign,
+	GLbitfield flags,
+	IMG_BOOL bRequestedCpuMappability,
+	IMG_BOOL bImmutable
+)
+{
+	IMG_CHAR szRIAPIString[DEVMEM_ANNOTATION_MAX_LEN];
+	PVRSRV_MEMALLOCFLAGS_T uAllocFlags;
+
+	uAllocFlags = PVRSRV_MEMALLOCFLAG_GPU_READABLE
+		| PVRSRV_MEMALLOCFLAG_GPU_WRITEABLE
+		| gc->ui32DevmemCacheAllocFlagsGPU;
+
+	if (flags & GL_CLIENT_STORAGE_BIT_EXT)
+	{
+		/* There may be other conditions for local memory, including the ability to map/update dynamically */
+		uAllocFlags |= PVRSRV_MEMALLOCFLAG_CPU_LOCAL;
+	}
+
+	if (bRequestedCpuMappability)
+	{
+		uAllocFlags |=
+			PVRSRV_MEMALLOCFLAG_CPU_READABLE |
+			PVRSRV_MEMALLOCFLAG_CPU_WRITEABLE |
+			gc->ui32DevmemCacheAllocFlagsCPU;
+	}
+
+	/* Create the RI API mem allocation description string */
+	snprintf(szRIAPIString, DEVMEM_ANNOTATION_MAX_LEN - 1, "%s mem for new BufObj BufID=%d Size=%ld",
+				bImmutable ? "glBufferStorageEXT" : "glBufferData",
+				(psBufObject->sNamedItem).ui32Name, size);
+
+	if (GLES3ALLOCDEVICEMEM(gc->psSysContext->hGeneralHeap,
+							uAllocFlags,
+							ui32AllocSize,
+							sAllocAlign,
+							szRIAPIString,
+							&psBufObject->psMemInfo) != PVRSRV_OK)
+	{
+		PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't allocate memory for object"));
+
+		psBufObject->psMemInfo = NULL;
+
+		SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+									"not enough memory to create a data store with the specified size");
+		return IMG_FALSE;
+	}
+	else
+	{
+		psBufObject->pvCpuVirtAddr = NULL;
+		if (bRequestedCpuMappability &&
+			PVRSRVAcquireCPUMapping(psBufObject->psMemInfo->hMemDesc,
+									&psBufObject->pvCpuVirtAddr) != PVRSRV_OK)
+		{
+			PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't acquire CPU mapping for object"));
+
+			GLES3FREEDEVICEMEM(psBufObject->psMemInfo);
+			psBufObject->psMemInfo = NULL;
+
+			SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+									"not enough memory to create a data store with the specified size");
+			return IMG_FALSE;
+		}
+		else
+		{
+			psBufObject->ui32BufferSize = size;
+			psBufObject->sAllocAlign = sAllocAlign;
+		}
+	}
+	return IMG_TRUE;
+}
+
+IMG_INTERNAL void BufferStorage(GLES3Context *gc, GLenum target, GLsizeiptr size, const void * data,
+								GLbitfield flags, GLenum usage, IMG_BOOL bImmutable, GLES3MemObject *psMemObject, GLuint64 offset,
+								EGLClientBuffer eglExternalClientBuffer)
+{
+	IMG_INT32 i32TargetIndex;
+	GLES3BufferObject **ppsBufBindingPoint, *psBufObject;
+	IMG_DEVMEM_ALIGN_T sAllocAlign;
+	IMG_UINT32 ui32AllocSize;
+	IMG_BOOL bDataStoreReallocated;
+	IMG_BOOL bDataStoreContentChanged = IMG_FALSE;
+	IMG_BOOL bRequestedCpuMappability = IMG_TRUE;
+	const IMG_BOOL bExternal = (IMG_BOOL)(eglExternalClientBuffer != NULL) || (IMG_BOOL)(psMemObject != NULL);
+	IMG_UINT32 ui32JobRef;
+
+	if (PVRSRVHasCpuNonMappableLocalMemory(gc->psDevConnection))
+	{
+		bRequestedCpuMappability = IMG_FALSE;
+	}
+
+#if !defined(GLES31_EXTENSION_BUFFER_STORAGE)
+	PVR_UNREFERENCED_PARAMETER(flags);
+#endif
+#if !defined(GLES31_EXTENSION_BUFFER_EXTERNAL) && !defined(GLES31_EXTENSION_MEMORY_OBJECT)
+    PVR_UNREFERENCED_PARAMETER(bExternal);
+#endif
+#if !defined(GLES31_EXTENSION_MEMORY_OBJECT)
+	PVR_UNREFERENCED_PARAMETER(psMemObject);
+	PVR_UNREFERENCED_PARAMETER(offset);
+#endif
+
+	/* Check the usage */
+	switch(usage)
+	{
+		case GL_STREAM_DRAW:
+		case GL_STREAM_READ:
+		case GL_STREAM_COPY:
+		case GL_STATIC_DRAW:
+		case GL_STATIC_READ:
+		case GL_STATIC_COPY:
+		case GL_DYNAMIC_DRAW:
+		case GL_DYNAMIC_READ:
+		case GL_DYNAMIC_COPY:
+		{
+			break;
+		}
+		default:
+		{
+			SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+					    "glBufferData: usage is not one of the accepted usage types");
+
+			return;
+		}
+	}
+
+	/* Check the target index */
+	if ((i32TargetIndex = GetBufferIndexFromTarget(target)) == -1)
+	{
+		SetErrorWithMessageForFunction(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+											"target is not one of the accepted buffer targets");
+		return;
+	}
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+	if(bImmutable)
+	{
+		/* Check the buffer data store size */
+		if(size <= 0)
+		{
+			SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					"glBufferStorageEXT: size is less than or equal to 0, which is an invalid value");
+			return;
+		}
+
+		if(flags & ~(GL_MAP_READ_BIT|GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT_EXT|GL_MAP_COHERENT_BIT_EXT|GL_DYNAMIC_STORAGE_BIT_EXT|GL_CLIENT_STORAGE_BIT_EXT))
+		{
+			SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+						"glBufferStorageEXT: flags has invalid bits set");
+			return;
+		}
+
+		if(flags & GL_MAP_PERSISTENT_BIT_EXT)
+		{
+			if((flags & (GL_MAP_READ_BIT|GL_MAP_WRITE_BIT)) == 0)
+			{
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+							"glBufferStorageEXT: flags has GL_MAP_PERSISTENT_BIT_EXT, but not one of GL_MAP_READ_BIT or GL_MAP_WRITE_BIT set");
+
+				return;
+			}
+		}
+
+		if(flags & GL_MAP_COHERENT_BIT_EXT)
+		{
+			if((flags & GL_MAP_PERSISTENT_BIT_EXT) == 0)
+			{
+				SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+							"glBufferStorageEXT: flags has GL_MAP_COHERENT_BIT_EXT, but not GL_MAP_PERSISTENT_BIT_EXT set");
+
+				return;
+			}
+		}
+	}
+	else
+#endif
+	{
+		/* Check the buffer data store size */
+		if(size < 0)
+		{
+			SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+								"glBufferData: size is negative, which is an invalid value");
+
+			return;
+		}
+	}
+
+	/* Get general buffer binding point */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+    if ((ppsBufBindingPoint == NULL) || ((psBufObject = *ppsBufBindingPoint) == NULL))
+	{
+		SetErrorWithMessageForFunction(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+											"reserved buffer object name 0 is bound to target");
+		return;
+	}
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+	if(psBufObject->bImmutable)
+	{
+		SetErrorWithMessageForFunction(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+											"buffer object is immutable");
+
+		return;
+	}
+#endif
+
+#if defined(GLES3_EXTENSION_TEXTURE_BUFFER) && defined(GLES31_EXTENSION_BINDLESS_TEXTURE)
+	GLES3TextureListNode* psTexNode = psBufObject->psBufferTextureList;
+	while (psTexNode)
+	{
+		if (psTexNode->psTexture->bUsedWithBindlessHandles)
+		{
+			SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+								"glBufferData: the buffer object is the backing store of a texture referenced by one or more texture handles");
+			return;
+		}
+		psTexNode  = psTexNode->psNextItem;
+	}
+#endif
+
+    if ((flags & (GL_MAP_WRITE_BIT | GL_MAP_READ_BIT)) || (gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+	{
+		bRequestedCpuMappability = IMG_TRUE;
+	}
+
+	/* Allocate/Reallocate data store for the bound buffer object */
+
+	/* Get the alloc size and alignment */
+	if(!GetDataStoreHWOffsetAndSize(i32TargetIndex, size, &sAllocAlign, &ui32AllocSize))
+	{
+		return;
+	}
+
+	ui32JobRef = gc->psRenderSurface?gc->psRenderSurface->sGlesKick.ui32JobRef:gc->ui32CurrentTAJobRef;
+	HWPerfClientFuncStart(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID, "BufferData/Storage");
+
+	/* Free the last allocated memory if necessary */
+	if (psBufObject->psMemInfo)
+	{
+		/* Wait until buffer object valid for change, no need to keep data store as
+		   it will be reallocated anyway if necessary
+		 */
+        IMG_BOOL bForceTAGhost = IMG_FALSE;
+        IMG_UINT32 ui32RequiredGhostSize = psBufObject->psMemInfo->uiAllocationSize;
+
+        if ((target == GL_ARRAY_BUFFER) || (target == GL_ELEMENT_ARRAY_BUFFER) || (target == GL_UNIFORM_BUFFER))
+        {
+            if (((psBufObject->ui32UseMethodFlag & GLES3_BUFFER_USED_BUT_NOT_BY_TA) == 0) &&
+				((gc->ui32GhostedBOMem + ui32RequiredGhostSize) < gc->sAppHints.ui32MaxGhostedBOMem))
+            {
+                bForceTAGhost = IMG_TRUE;
+            }
+        }
+
+		if (WaitForBufferObjectValidForChange(gc, psBufObject, bForceTAGhost ? GLES3_GHOST_DATASTORE_USED_IN_TA : 0, NULL))
+		{
+            if (bForceTAGhost)
+            {
+                /* Increase the ghost counter */
+				gc->ui32GhostedBOMem += ui32RequiredGhostSize;
+            }
+
+			if (psBufObject->psMemInfo != NULL)
+			{
+				if ((psBufObject->psMemInfo->uiAllocationSize != ui32AllocSize) ||
+					(psBufObject->sAllocAlign != sAllocAlign) ||
+					bExternal)
+				{
+					PVRSRVReleaseCPUMapping(psBufObject->psMemInfo->hMemDesc);
+					psBufObject->pvCpuVirtAddr = NULL;
+
+					GLES3FREEDEVICEMEM(psBufObject->psMemInfo);
+					psBufObject->psMemInfo = NULL;
+
+					psBufObject->ui32BufferSize = 0;
+					psBufObject->sAllocAlign = 0;
+				}
+				else
+				{
+					psBufObject->ui32BufferSize = size;
+					bDataStoreReallocated = IMG_FALSE;
+				}
+			}
+		}
+		else
+		{
+			PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't update/free buffer as buffer didn't become free"));
+
+			SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+											" buffer data cannot be altered since it is still in use elsewhere");
+
+			HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+			return;
+		}
+	}
+
+	/* Allocate the new data store if necessary */
+#if defined(GLES31_EXTENSION_MEMORY_OBJECT)
+	if (psMemObject)
+	{
+		GLES_ASSERT(eglExternalClientBuffer == NULL);
+		psBufObject->psMemInfo = GetMemoryObjectMemInfo(gc, "Imported Vulkan buffer", psMemObject->iFd, offset);
+
+		if (!psBufObject->psMemInfo)
+		{
+			PVR_DPF((PVR_DBG_ERROR,"BufferStorage: Can't import Vulkan buffer"));
+			HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+			return;
+		}
+
+		bDataStoreReallocated = IMG_TRUE;
+
+		psBufObject->bExternal = IMG_TRUE;
+		psBufObject->ui32BufferSize = psMemObject->ui64Size - offset;
+	}
+	else
+#endif
+	if (psBufObject->psMemInfo == NULL)
+	{
+		if (size > 0)
+		{
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL)
+			if(eglExternalClientBuffer != NULL)
+			{
+				const IMGEGLBuffer *psEGLBuffer = (const IMGEGLBuffer *)eglExternalClientBuffer;
+
+				/* Dummy mem-info */
+				psBufObject->psMemInfo = GLES3Calloc(sizeof(PVRSRV_MEMINFO));
+				if(!psBufObject->psMemInfo)
+				{
+					PVR_DPF((PVR_DBG_ERROR, "%s: %i failed to allocate dummy psMemInfo.\n", __func__, __LINE__));
+					HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+					return;
+				}
+
+				/* From spec table 6.3 */
+				psBufObject->ui32BufferSize = size;
+				psBufObject->eUsage = usage;
+				psBufObject->eAccess = 0;
+				psBufObject->bMapped = IMG_FALSE;
+				psBufObject->pvBufferMapPointer = NULL;
+				psBufObject->ui32BufferMapOffset = 0;
+				psBufObject->ui32BufferMapLength = 0;
+
+				psBufObject->bImmutable = IMG_TRUE;
+				psBufObject->bExternal = IMG_TRUE;
+
+				psBufObject->psMemInfo->hMemDesc = psEGLBuffer->hMemDesc;
+				psBufObject->psMemInfo->sDevVirtAddr = psEGLBuffer->sDevVirtAddr;
+				psBufObject->ui32BufferSize = psEGLBuffer->ui32Size;
+
+				if(PVRSRVAcquireCPUMapping(psBufObject->psMemInfo->hMemDesc, &psBufObject->pvCpuVirtAddr) != PVRSRV_OK)
+				{
+					PVR_DPF((PVR_DBG_ERROR, "%s: %i PVRSRVAcquireCPUMapping() returned an error.\n", __func__, __LINE__));
+					GLES3Free(psBufObject->psMemInfo);
+					HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+					return;
+				}
+			}
+			else
+#endif
+			{
+				AllocateBufferStorage(gc, psBufObject, size, ui32AllocSize, sAllocAlign, flags, bRequestedCpuMappability, bImmutable);
+			}
+		}
+
+		/* We have created a new buffer data store.
+		   This is true even for size == 0 as the original data store is freed which is taken as
+		   a special case of data store reallocated.
+		 */
+		bDataStoreReallocated = IMG_TRUE;
+	}
+
+	/* Copy passed-in data if necessary */
+	if (data && psBufObject->psMemInfo)
+	{
+		GLES_ASSERT(!bExternal);
+
+		if (bRequestedCpuMappability)
+		{
+			GLES3DeviceMemCopy(psBufObject->pvCpuVirtAddr, (const void *)data, (IMG_UINT32)size);
+			bDataStoreContentChanged = IMG_TRUE;
+			FlushCachedDevmem(psBufObject->psMemInfo, GL_MAP_WRITE_BIT);
+#if defined(PDUMP)
+			if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+			{
+				psBufObject->bDumped = IMG_FALSE;
+			}
+			else
+			{
+				PDumpBufferObjectDataStore(gc, psBufObject, IMG_FALSE);
+			}
+#endif
+		}
+		else
+		{
+			/* If there is no CPU mapping for the buffer object, create a temp
+			 * buffer with mapping, upload the data to it, and then use TQ to
+			 * upload the data to the destination buffer
+			 */
+			IMG_UINT32 ui32CopySize = size;
+			void* pvCpuVirtAddr = NULL;
+
+			if (gc->sStagingBuffer.psMemInfo == NULL)
+			{
+				if (!AllocStagingBuffer(gc, &gc->sStagingBuffer, size))
+				{
+					PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't allocate memory for staging buffer"));
+
+					SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+												"not enough memory to create a staging buffer with the specified size");
+					HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+					return;
+				}
+			}
+			else if (gc->sStagingBuffer.uiSize < (IMG_UINT32)size)
+			{
+				RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &gc->sStagingBuffer.sResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+				if (!GrowStagingBuffer(gc, &gc->sStagingBuffer, size))
+				{
+					PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't allocate memory for staging buffer"));
+
+					SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+												"not enough memory to create a staging buffer with the specified size");
+					HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+					return;
+				}
+			}
+
+			RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &gc->sStagingBuffer.sResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+
+            if (PVRSRVAcquireCPUMapping(gc->sStagingBuffer.psMemInfo->hMemDesc, &pvCpuVirtAddr) != PVRSRV_OK)
+			{
+				PVR_DPF((PVR_DBG_ERROR,"AllocateBufferDataStore: Can't acquire CPU mapping for staging buffer"));
+
+				SetErrorWithMessageForFunction(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, bImmutable ? "glBufferStorageEXT" : "glBufferData",
+										"not enough memory to create a staging buffer with the specified size");
+			}
+			else
+			{
+				GLES3DeviceMemCopy(pvCpuVirtAddr, (const void *)data, (IMG_UINT32)size);
+				FlushCachedDevmemRange(gc->sStagingBuffer.psMemInfo, 0, (IMG_DEVMEM_SIZE_T)size, GL_MAP_WRITE_BIT);
+				PVRSRVReleaseCPUMapping(gc->sStagingBuffer.psMemInfo->hMemDesc);
+
+				PDUMP_MEM(gc, gc->sStagingBuffer.psMemInfo, 0, gc->sStagingBuffer.psMemInfo->uiAllocationSize);
+
+				ui32CopySize = TQCopyBetweenBufferDataStores(gc,
+					psBufObject, &psBufObject->sRMResource, psBufObject->psMemInfo, 0,
+					NULL, &gc->sStagingBuffer.sResource, gc->sStagingBuffer.psMemInfo, 0,
+					size, NULL);
+
+				if (ui32CopySize != 0)
+				{
+					/* TQ failed, free the non mappable buffer storage and
+					 * create a mappable one. Upload data using memcpy
+					 */
+					GLES3FREEDEVICEMEM(psBufObject->psMemInfo);
+					psBufObject->psMemInfo = NULL;
+					if (AllocateBufferStorage(gc, psBufObject, size, ui32AllocSize, sAllocAlign, flags, IMG_TRUE, bImmutable))
+					{
+						GLES3DeviceMemCopy(psBufObject->pvCpuVirtAddr, (const void *)data, (IMG_UINT32)size);
+						bDataStoreContentChanged = IMG_TRUE;
+						FlushCachedDevmem(psBufObject->psMemInfo, GL_MAP_WRITE_BIT);
+			        	RM_NotifyCPUOperation(gc->psSysContext->psRM, &psBufObject->sRMResource, RM_USAGE_WRITE);
+#if defined(PDUMP)
+						if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+						{
+							psBufObject->bDumped = IMG_FALSE;
+						}
+						else
+						{
+							PDumpBufferObjectDataStore(gc, psBufObject, IMG_FALSE);
+						}
+#endif
+					}
+					else
+					{
+						/* Allocation of CPU mappable buffer storage also failed,
+						 * there is no way to transfer initial data. All the
+						 * error messages are set in AllocateBufferStorage
+						 */
+						HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+						return;
+					}
+				}
+				else
+				{
+					bDataStoreContentChanged = IMG_TRUE;
+#if defined(PDUMP)
+					psBufObject->bRequirePDumpPol = IMG_TRUE;
+#endif
+				}
+			}
+		}
+	}
+	else
+	{
+		LogKHRDebugWarningForObjectsIfDMEnabled(gc, TYPE_UNDEFINED_BEHAVIOR, SEVERITY(HIGH), "",
+				KHR_DEBUG_MSG_NULL_BUFFER_POINTER, psBufObject->sNamedItem.pszLabel);
+	}
+
+	/* Save information */
+	psBufObject->eUsage = usage;
+	psBufObject->bMapped = IMG_FALSE;
+	psBufObject->bMappedNonPersistent = IMG_FALSE;
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+	psBufObject->bImmutable = bImmutable;
+	psBufObject->ui32StorageFlags = flags;
+#endif
+
+	/* Process buffer data store change */
+	ProcessBufferDataStoreChange(gc, psBufObject, bDataStoreReallocated, bDataStoreContentChanged);
+
+	HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERDATA, ui32JobRef, gc->ui32ContextID);
+}
+
+
+/***********************************************************************************
+ Function Name      : glBufferData
+ Inputs             : target, size, data, usage
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Saves buffer data and hints to bound buffer object
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBufferData"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBufferData);
+
+	BufferStorage(gc, target, size, data, GL_DYNAMIC_STORAGE_BIT_EXT | GL_MAP_READ_BIT | GL_MAP_WRITE_BIT, usage, IMG_FALSE, NULL, 0, NULL);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBufferData);
+}
+
+
+/***********************************************************************************
+ Function Name      : glBufferSubData
+ Inputs             : target, offset, size, data
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Updates portion of buffer data to bound buffer object
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data)
+{
+	IMG_INT32 i32TargetIndex;
+	GLES3BufferObject **ppsBufBindingPoint, *psBufObj;
+	IMG_BOOL bDataStoreReallocated;
+
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBufferSubData"));
+
+	GLES3_TIME_START(GLES3_TIMES_glBufferSubData);
+
+	/* Check the target index */
+	if ((i32TargetIndex = GetBufferIndexFromTarget(target)) == -1)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+					"glBufferSubData: target is not one of the accepted buffer targets");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+	/* check the size and offset */
+	if(size < 0 || offset < 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					"glBufferSubData: offset or size is negative, which is invalid");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+	/* Get general buffer binding point */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+	if (ppsBufBindingPoint == NULL || *ppsBufBindingPoint == NULL)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glBufferSubData: reserved buffer object name 0 is bound to target");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+	psBufObj = *ppsBufBindingPoint;
+
+	if (psBufObj->bMappedNonPersistent && ((IMG_UINT32)offset < psBufObj->ui32BufferMapOffset + psBufObj->ui32BufferMapLength) &&
+		((IMG_UINT32)(offset + size) > psBufObj->ui32BufferMapOffset))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glBufferSubData: buffer object being updated is mapped in an overlapping range",
+					      psBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+	if((IMG_UINT32)(offset + size) > psBufObj->ui32BufferSize)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					      "glBufferSubData: offset and size together refer to a region of memory that extends"
+					      " beyond the buffer object's allocated data store",
+					      psBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+	if(psBufObj->bImmutable && ((psBufObj->ui32StorageFlags & GL_DYNAMIC_STORAGE_BIT_EXT) == 0))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glBufferSubData: buffer object is immutable and doesn't have GL_DYNAMIC_STORAGE_BIT_EXT set");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+#endif
+
+	if(!psBufObj->psMemInfo)
+	{
+		PVR_DPF((PVR_DBG_ERROR,"glBufferSubData: No memory for object data"));
+		SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+					      "glBufferSubData: buffer object is having no data store",
+					      psBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+		return;
+	}
+
+	if (data)
+	{
+		IMG_UINT32 ui32JobRef;
+
+		ui32JobRef = gc->psRenderSurface?gc->psRenderSurface->sGlesKick.ui32JobRef:gc->ui32CurrentTAJobRef;
+		HWPerfClientFuncStart(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERSUBDATA, ui32JobRef, gc->ui32ContextID, "glBufferSubData");
+
+        if ((psBufObj->ui32BufferSize == (IMG_UINT32)size)/* ||
+            (((IMG_UINT32)size < (psBufObj->ui32BufferSize * 2 / 3)) &&
+             (psBufObj->ui32BufferSize <= 4096))*/)
+        {
+            /* Special case when sub is the entire buffer or update a small part of a small buffer */
+
+            IMG_BOOL bForceTAGhost = IMG_FALSE;
+            IMG_UINT32 ui32RequiredGhostSize = psBufObj->psMemInfo->uiAllocationSize;
+
+            if ((target == GL_ARRAY_BUFFER) || (target == GL_ELEMENT_ARRAY_BUFFER) || (target == GL_UNIFORM_BUFFER))
+            {
+				if (((psBufObj->ui32UseMethodFlag & GLES3_BUFFER_USED_BUT_NOT_BY_TA) == 0) &&
+					((gc->ui32GhostedBOMem + ui32RequiredGhostSize) < gc->sAppHints.ui32MaxGhostedBOMem)
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL)
+					&& (!psBufObj->bExternal)
+#endif
+					)
+                {
+                    bForceTAGhost = IMG_TRUE;
+                }
+            }
+
+            if (WaitForBufferObjectValidForChange(gc, *ppsBufBindingPoint,
+                    (bForceTAGhost ? GLES3_GHOST_DATASTORE_USED_IN_TA : 0) |
+                    GLES3_NEW_DATASTORE_AFTER_GHOST |
+                    ((psBufObj->ui32BufferSize == (IMG_UINT32)size) ? 0 : (GLES3_COPY_OLD_DATASTORE_CONTENT | GLES3_COPY_OLD_DATASTORE_CPU)),
+                    &bDataStoreReallocated))
+		    {
+			    void *pvDst;
+
+                if (bForceTAGhost)
+                {
+                    gc->ui32GhostedBOMem += ui32RequiredGhostSize;
+                }
+
+			    pvDst = (void *)((IMG_UINT8 *)psBufObj->pvCpuVirtAddr + offset);
+
+			    GLES3DeviceMemCopy(pvDst, (const void *)data, (IMG_UINT32)size);
+			    FlushCachedDevmemRange(psBufObj->psMemInfo, offset, size, GL_MAP_WRITE_BIT);
+
+#if defined(PDUMP)
+                psBufObj->bDumped = IMG_FALSE;
+#endif
+
+			    /* Process buffer data store change */
+			    ProcessBufferDataStoreChange(gc, psBufObj, bDataStoreReallocated, IMG_TRUE);
+		    }
+            else
+		    {
+			    PVR_DPF((PVR_DBG_ERROR,"glBufferSubData: Can't update data as buffer didn't become free"));
+
+			    SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+						            "glBufferSubData: buffer data cannot be altered since it is still in use elsewhere",
+						            psBufObj->sNamedItem.pszLabel);
+
+			    GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+				HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+
+			    return;
+		    }
+        }
+        else
+        {
+            PVRSRV_MEMINFO *psOrigMemInfo = psBufObj->psMemInfo;
+
+			IMG_BOOL bTryGhostWait = WaitForBufferObjectValidForChange(gc,
+																	   *ppsBufBindingPoint,
+																		GLES3_NEW_DATASTORE_AFTER_GHOST | GLES3_COPY_OLD_DATASTORE_CONTENT,
+																		&bDataStoreReallocated);
+
+			/* If same, buffer is not ghosted and valid for change, write to buffer data store directly */
+			IMG_BOOL bGhosted = (psOrigMemInfo != psBufObj->psMemInfo) ? IMG_TRUE : IMG_FALSE;
+
+
+            if (bTryGhostWait && bGhosted)
+            {
+                IMG_UINT32 ui32SubDataSize = size;
+				PVRSRV_MEMINFO *psSubBufferMemInfo = NULL;
+
+#if defined(RGX_FEATURE_TLA) || (defined(RGX_FEATURE_FASTRENDER_DM) && !defined(RGX_TDM_OVERLAP_WITH_3D_DISABLED))
+                if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+                {
+                    if (TQM_ALLOC_DEVICE_MEM(gc->psSysContext, ui32SubDataSize, &psSubBufferMemInfo) == PVRSRV_OK)
+                    {
+                    	void *pvSource;
+
+                        if (PVRSRVAcquireCPUMappingMIW(psSubBufferMemInfo, &pvSource) == PVRSRV_OK)
+                        {
+                            IMG_UINT32 ui32Remain;
+
+                            /* Fill the source */
+                            GLES3DeviceMemCopy(pvSource, (const void *)data, (IMG_UINT32)size);
+                            FlushCachedDevmemRange(psSubBufferMemInfo, 0, size, GL_MAP_WRITE_BIT);
+
+
+                            PVRSRVReleaseCPUMappingMIW(psSubBufferMemInfo);
+
+                            /* Upload using TQ */
+                            ui32Remain = TQCopyBetweenBufferDataStores(gc,
+                                psBufObj, &psBufObj->sRMResource, psBufObj->psMemInfo, offset,
+                                NULL, NULL, psSubBufferMemInfo, 0,
+                                ui32SubDataSize, psSubBufferMemInfo);
+
+                            if(ui32Remain != ui32SubDataSize)
+                            {
+                            	/* The TQ did copy at least something */
+								ui32SubDataSize = ui32Remain;
+
+								if (ui32SubDataSize < (IMG_UINT32)size)
+								{
+									/* TQ in action, add the intermediate buffer to the managed buffer list */
+								/*	if (!TQMAddBufferToQueueRM(gc->psSysContext, psSubBufferMemInfo))
+									{
+										RM_WaitForHWQueue(gc->psSysContext->psRM, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+
+										GLES3FREEDEVICEMEM(psSubBufferMemInfo);
+									}*/
+								}
+                            }
+                            else
+                            {
+                            	/* Nothing was copied through TQ */
+								GLES3FREEDEVICEMEM(psSubBufferMemInfo);
+                            	psSubBufferMemInfo = NULL;
+                            }
+                        }
+                        else
+                        {
+                        	/* PVRSRVAcquireCPUMappingMIW failed */
+							GLES3FREEDEVICEMEM(psSubBufferMemInfo);
+                        	psSubBufferMemInfo = NULL;
+                        }
+                    }
+                }
+#endif
+
+                if (ui32SubDataSize > 0)
+                {
+                    /* There is still content left needs to be copied through CPU. */
+#if defined(DEBUG)
+                    if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+                    {
+                        PVR_DPF((PVR_DBG_WARNING, "glBufferSubData: %d out of %d is copied through CPU.  This is slow but NOT an error.", ui32SubDataSize, (IMG_UINT32)size));
+                    }
+#endif
+
+                    /* We might have ghosted + copied old data with the TQ, need to wait */
+                    RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufObj->sRMResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+
+                    if (psSubBufferMemInfo)
+                    {
+						RMLog(gc->psSysContext->psRM,
+							  RM_LL_RESOURCE,
+							  RM_LOG_RESOURCEF " FREE BufferObjectSubData meminfo "IMG_DEV_VIRTADDR_FMTSPEC" size "IMG_DEV_VIRTADDR_FMTSPEC"\n",
+							  RM_LOG_RESOURCE((&psBufObj->sRMResource)),
+							  psSubBufferMemInfo->sDevVirtAddr.uiAddr,
+							  psSubBufferMemInfo->uiAllocationSize);
+
+						GLES3FREEDEVICEMEM(psSubBufferMemInfo);
+                    	psSubBufferMemInfo = NULL;
+                    }
+
+                    GLES3DeviceMemCopy((void *)((IMG_UINT8 *)(psBufObj->pvCpuVirtAddr) + offset + size - ui32SubDataSize),
+										(const void *)((IMG_UINT8 *)data + size - ui32SubDataSize), (IMG_UINT32)ui32SubDataSize);
+
+                    FlushCachedDevmemRange(psBufObj->psMemInfo, offset + size - ui32SubDataSize, ui32SubDataSize, GL_MAP_WRITE_BIT);
+                }
+
+#if defined(PDUMP)
+                if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+                {
+                    psBufObj->bDumped = IMG_FALSE;
+                }
+                else
+                {
+                    PDumpBufferObjectDataStore(gc, psBufObj, IMG_FALSE);
+                }
+#endif
+
+                /* Process buffer data store change */
+			    ProcessBufferDataStoreChange(gc, psBufObj, bDataStoreReallocated, IMG_TRUE);
+            }
+			else if ((bTryGhostWait && !bGhosted) ||
+                     (WaitForBufferObjectContentValid(gc, *ppsBufBindingPoint) &&
+					  WaitForBufferObjectValidForChange(gc, *ppsBufBindingPoint, GLES3_CPU_BLOCK_ON_DATASTORE, NULL)))
+            {
+				GLES3DeviceMemCopy((void *)((IMG_UINT8 *)(psBufObj->pvCpuVirtAddr) + offset), data, size);
+                FlushCachedDevmemRange(psBufObj->psMemInfo, offset, size, GL_MAP_WRITE_BIT);
+
+#if defined(PDUMP)
+                if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+                {
+                    psBufObj->bDumped = IMG_FALSE;
+                }
+                else
+                {
+                    PDumpBufferObjectDataStore(gc, psBufObj, IMG_FALSE);
+                }
+#endif
+
+                /* Process buffer data store change */
+			    ProcessBufferDataStoreChange(gc, psBufObj, IMG_FALSE, IMG_TRUE);
+            }
+            else
+            {
+                PVR_DPF((PVR_DBG_ERROR,"glBufferSubData: Can't update data as buffer didn't become free"));
+
+			    SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+						            "glBufferSubData: buffer data cannot be altered since it is still in use elsewhere",
+						            psBufObj->sNamedItem.pszLabel);
+
+			    GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+				HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+
+				return;
+            }
+        }
+		HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_BUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+	} /* if (data) */
+	else
+	{
+		LogKHRDebugWarningForObjectsIfDMEnabled(gc, TYPE_UNDEFINED_BEHAVIOR, SEVERITY(HIGH), "glBufferSubData",
+				KHR_DEBUG_MSG_NULL_BUFFER_POINTER, psBufObj->sNamedItem.pszLabel);
+	}
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBufferSubData);
+}
+
+
+/***********************************************************************************
+ Function Name      : MapBufferRange
+ Inputs             : gc, i32TargetIndex, access, offset, length
+ Outputs            : -
+ Returns            : void*
+ Description        : Map a range of a bound buffer object
+************************************************************************************/
+GLES_STATIC void * MapBufferRange(GLES3Context * gc, IMG_INT32 i32TargetIndex,
+							 GLbitfield access,
+							 IMG_BOOL bRangeSet,
+							 GLintptr offset, GLsizeiptr length)
+{
+	GLES3BufferObject **ppsBufBindingPoint;
+	GLES3BufferObject *psBufObject;
+	IMG_DEVMEM_ALIGN_T sAllocAlign;
+	IMG_UINT32 ui32AllocSize;
+	void * pvBuffer = NULL;
+
+	/* Check the target index */
+	if (i32TargetIndex == -1)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    "glMapBufferRange: target is not one of the accepted buffer targets");
+		return NULL;
+	}
+
+	/* Check the access bit field. */
+	if (access & ~(GL_MAP_READ_BIT |
+				   GL_MAP_WRITE_BIT |
+				   GL_MAP_INVALIDATE_RANGE_BIT |
+				   GL_MAP_INVALIDATE_BUFFER_BIT |
+				   GL_MAP_FLUSH_EXPLICIT_BIT |
+				   GL_MAP_UNSYNCHRONIZED_BIT
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+				   | GL_MAP_PERSISTENT_BIT_EXT
+				   | GL_MAP_COHERENT_BIT_EXT
+#endif
+				   ))
+	{
+		/* access has any bits set other than those defined */
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+				    "glMapBufferRange: access has bits set other than those defined");
+		return NULL;
+	}
+
+	if (!(access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)))
+	{
+		/* Neither GL_MAP_READ_BIT nor GL_MAP_WRITE_BIT is set */
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glMapBufferRange: access has neither the GL_MAP_READ_BIT nor the GL_MAP_WRITE_BIT set");
+		return NULL;
+	}
+
+	if ((access & GL_MAP_READ_BIT) &&
+		(access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT)))
+	{
+		/*	GL_MAP_READ_BIT is set and any of GL_MAP_INVALIDATE_RANGE_BIT, GL_MAP_INVALIDATE_BUFFER_BIT,
+			or GL_MAP_UNSYNCHRONIZED_BIT is set */
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glMapBufferRange: access has the GL_MAP_READ_BIT set and simultaneously the GL_MAP_INVALIDATE_RANGE_BIT,"
+				    " or the GL_MAP_INVALIDATE_BUFFER_BIT, or the GL_MAP_UNSYNCHRONIZED_BIT is also set");
+		return NULL;
+	}
+
+	if ((access & GL_MAP_FLUSH_EXPLICIT_BIT) && (!(access & GL_MAP_WRITE_BIT)))
+	{
+		/* GL_MAP_FLUSH_EXPLICIT_BIT is set and GL_MAP_WRITE_BIT is not set.*/
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glMapBufferRange: access has the GL_MAP_FLUSH_EXPLICIT_BIT set and the GL_MAP_WRITE_BIT is not set");
+		return NULL;
+	}
+
+	/* Ignore GL_MAP_UNSYNCHRONIZED_BIT to force synchronised buffers */
+	if (gc->sAppHints.bForceSynchronousBuffers)
+	{
+		access &= ~GL_MAP_UNSYNCHRONIZED_BIT;
+	}
+
+	/* Get general buffer binding point */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+	/* Get the bound buffer object and check its availability */
+	if ((ppsBufBindingPoint == NULL) || ((psBufObject = *ppsBufBindingPoint) == NULL))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glMapBufferRange: reserved buffer object name 0 is bound to target");
+		return NULL;
+	}
+
+	/* Check the specified mapping range */
+	if (bRangeSet)
+	{
+		if (length == 0)
+		{
+			SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+						      "glMapBufferRange: length is zero",
+						      psBufObject->sNamedItem.pszLabel);
+
+			return NULL;
+		}
+
+		if ((offset < 0) || (length < 0) || ((IMG_UINT32)(offset + length) > psBufObject->ui32BufferSize))
+		{
+			SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+						      "glMapBufferRange: offset or length is negative, or (offset + length)"
+						      " is greater than the value of GL_BUFFER_SIZE",
+						      psBufObject->sNamedItem.pszLabel);
+
+			return NULL;
+		}
+	}
+	else
+	{
+		offset = 0;
+		length = psBufObject->ui32BufferSize;
+	}
+
+	/* Check if this buffer object has already been mapped */
+	if (psBufObject->bMapped)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glMapBufferRange: buffer is already in a mapped state",
+					      psBufObject->sNamedItem.pszLabel);
+
+		return NULL;
+	}
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL)
+	if(!psBufObject->bExternal)
+#endif
+	{
+		if((access & (GL_MAP_READ_BIT|GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT_EXT|GL_MAP_COHERENT_BIT_EXT) & psBufObject->ui32StorageFlags) !=
+			(access & (GL_MAP_READ_BIT|GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT_EXT|GL_MAP_COHERENT_BIT_EXT)))
+		{
+			SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+							  "glMapBufferRange: buffer access flags do not match buffer storage flags",
+							  psBufObject->sNamedItem.pszLabel);
+
+			return NULL;
+		}
+	}
+#endif
+
+	/* Reset map operation flag */
+	psBufObject->ui32MapOPFlag = 0;
+
+	/* Setup map based on different access bits combination */
+	if ((access & GL_MAP_READ_BIT) != 0)
+	{
+		/* A read requires the content in the buffer data store valid
+		   before reading it.
+		 */
+		if (!WaitForBufferObjectContentValid(gc, psBufObject))
+		{
+			PVR_DPF((PVR_DBG_ERROR,"MapBufferRange: Buffer didn't become valid"));
+			SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+						      "glMapBufferRange: buffer contents not valid yet",
+						      psBufObject->sNamedItem.pszLabel);
+
+			return NULL;
+		}
+
+		if ((access & GL_MAP_WRITE_BIT) != 0)
+		{
+			/* We need to write, as at same time, we need data valid for reading.  This can be
+			   achieved by waiting for content valid for reading purpose and then waiting for
+			   buffer valid for change for writing purpose.  The content of data store must be
+			   kept for reading purpose.
+
+			   !!! Spec review:
+			         During this process, the buffer data store may be changed because of the
+					 using of ghosting.  This may cause error in the following process.  For
+					 example, if a buffer object A is used in both transform feedback and uniform
+					 buffer object for a fragment shader, after this process, the data store is
+					 changed (although its content is not if data store is valid).  The old data
+					 store, which is ghosted, will be freed if one frame is finished.  If TF is
+					 still active afterwards, the stream out program writing to this invalid old
+					 data store may cause termination and needs to be regenerated.
+
+						 * This function should not be called when TF is active, as suggested
+						   by SPEC, however, it is not cannot be called.  However, does the driver
+						   need to do something to make sure no termination when this un-proper
+						   operation happens?
+
+					       Anyway, will this happen in practice?
+
+						   If this is required, one method can be used is add additional check in resume to
+						   see if bound buffer is changed since last begin and then either stop this
+						   resume or regenerate all necessary stream out/sync programs.
+			   !!!
+			 */
+			IMG_BOOL bDataStoreReallocated = IMG_FALSE;
+
+			if (!WaitForBufferObjectValidForChange(gc, psBufObject, GLES3_CPU_BLOCK_ON_DATASTORE, &bDataStoreReallocated))
+			{
+				PVR_DPF((PVR_DBG_ERROR,"MapBufferRange: Buffer cannot be mapped"));
+				SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+							      "glMapBufferRange: buffer data cannot be altered since it is"
+							      " still in use elsewhere",
+							      psBufObject->sNamedItem.pszLabel);
+				return NULL;
+			}
+
+			FlushCachedDevmem(psBufObject->psMemInfo, GL_MAP_READ_BIT);
+
+			/* Process buffer data store changed */
+			ProcessBufferDataStoreChange(gc, psBufObject, bDataStoreReallocated, IMG_TRUE);
+		}
+		else
+		{
+			FlushCachedDevmem(psBufObject->psMemInfo, GL_MAP_READ_BIT);
+		}
+
+		pvBuffer = (void *)((IMG_UINT8 *)psBufObject->pvCpuVirtAddr + offset);
+	}
+	else
+	{
+		/* Now we only consider pure WRITE operation */
+		if ((access & GL_MAP_UNSYNCHRONIZED_BIT) != 0)
+		{
+			/* Unsynchronised writing grants the synchronisation to client */
+			pvBuffer = (void *)((IMG_UINT8 *)psBufObject->pvCpuVirtAddr + offset);
+
+			/* Process buffer data store changed */
+			ProcessBufferDataStoreChange(gc, psBufObject, IMG_FALSE, IMG_TRUE);
+		}
+		else
+		{
+            if ((access & (GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT)) != 0
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+                && !psBufObject->bImmutable
+#endif
+                )
+            {
+				IMG_BOOL bAllocated = IMG_FALSE;
+
+				IMG_CHAR szRIAPIString[DEVMEM_ANNOTATION_MAX_LEN];
+
+				snprintf(szRIAPIString, DEVMEM_ANNOTATION_MAX_LEN - 1, "MapBufferRange backup data store for client BufID=%d Size=%d", (psBufObject->sNamedItem).ui32Name, psBufObject->ui32BufferSize);
+
+				/* Try to allocate a backup buffer data store for client to use, this can allow
+				   driver and client application can run simultaneously for some time.
+				 */
+				GLES_ASSERT(psBufObject->psBackupMemInfo == NULL);
+				GLES_ASSERT(psBufObject->pvBackupCpuVirtAddr == NULL);
+
+				/* If invalidating the entire buffer then rellocate the current buffer size, not the size of the mapped range */
+				if (((access & GL_MAP_INVALIDATE_BUFFER_BIT) != 0) ||
+                    ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0))
+				{
+                    /* The backup buffer will be used to replace the original buffer data store.  Create the backup buffer
+                       such that it can be used as buffer data store
+                     */
+					if (!GetDataStoreHWOffsetAndSize(i32TargetIndex,
+                            (access & GL_MAP_INVALIDATE_BUFFER_BIT) != 0 ? psBufObject->ui32BufferSize : (IMG_UINT32)length,
+                            &sAllocAlign, &ui32AllocSize))
+					{
+						return NULL;
+					}
+
+                    if (GLES3ALLOCDEVICEMEM(gc->psSysContext->hGeneralHeap,
+                            PVRSRV_MEMALLOCFLAG_CPU_READABLE | PVRSRV_MEMALLOCFLAG_CPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsCPU |
+							PVRSRV_MEMALLOCFLAG_GPU_READABLE | PVRSRV_MEMALLOCFLAG_GPU_WRITEABLE | gc->ui32DevmemCacheAllocFlagsGPU,
+							ui32AllocSize,
+							sAllocAlign,
+							szRIAPIString,
+							&psBufObject->psBackupMemInfo) == PVRSRV_OK)
+                    {
+                        if (PVRSRVAcquireCPUMapping(psBufObject->psBackupMemInfo->hMemDesc,
+                                &psBufObject->pvBackupCpuVirtAddr) == PVRSRV_OK)
+					    {
+						    bAllocated = IMG_TRUE;
+					    }
+					    else
+					    {
+							GLES3FREEDEVICEMEM(psBufObject->psBackupMemInfo);
+						    psBufObject->psBackupMemInfo = NULL;
+						    psBufObject->pvBackupCpuVirtAddr = NULL;
+					    }
+                    }
+				}
+				else
+				{
+					/* The backup buffer will be used in TQ to copy data back to original buffer data store.
+                       Create the backup buffer such that it can be managed by TQ.
+                     */
+                    if (TQM_ALLOC_DEVICE_MEM(gc->psSysContext, length, &psBufObject->psBackupMemInfo) == PVRSRV_OK)
+                    {
+                        if (PVRSRVAcquireCPUMappingMIW(psBufObject->psBackupMemInfo, &psBufObject->pvBackupCpuVirtAddr) == PVRSRV_OK)
+                        {
+                            bAllocated = IMG_TRUE;
+                        }
+                        else
+                        {
+							GLES3FREEDEVICEMEM(psBufObject->psBackupMemInfo);
+                            psBufObject->psBackupMemInfo = NULL;
+                            psBufObject->pvBackupCpuVirtAddr = NULL;
+                        }
+                    }
+				}
+
+				if (bAllocated)
+				{
+					pvBuffer = (void *)((IMG_UINT8 *)psBufObject->pvBackupCpuVirtAddr);
+
+					/* Use the new allocated backup buffer data store */
+					if ((access & GL_MAP_INVALIDATE_BUFFER_BIT) != 0)
+					{
+						/* The backup buffer storage will be used when flushing.
+
+						   Even with GL_MAP_FLUSH_EXPLICIT_BIT, this flush is always
+						   processed during the Unmap.  However, MAP_BUFOBJ_FLUSH_BY_UNMAP
+						   will not be set up here but in glFlushMappedBufferRange.
+						   This can make Unmap not flush if no glFlushMappedBufferRange is
+						   ever called in order to confirm with the SPEC.
+						 */
+
+						psBufObject->ui32MapOPFlag = GLES3_MAP_BUFOBJ_USE_BACKUP;
+						if ((access & GL_MAP_FLUSH_EXPLICIT_BIT) == 0)
+						{
+							psBufObject->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_FLUSH_BY_UNMAP;
+						}
+
+						/* Bias the offset if we're mapping a range but reallocating the entire buffer */
+						if (bRangeSet)
+						{
+							pvBuffer = (void*)((IMG_UINT8*)psBufObject->pvBackupCpuVirtAddr + offset);
+						}
+					}
+					else if ((access & GL_MAP_INVALIDATE_RANGE_BIT) != 0)
+					{
+						/* The backup buffer storage cannot be used instead of original buffer data store but
+						   rather its content needs to be copied back to the original buffer data store.
+
+						   However, as invalid range bit is set, only one flush should be used.  The same
+						   method is used as that is used in the above case
+						 */
+						psBufObject->ui32MapOPFlag = GLES3_MAP_BUFOBJ_COPY_BACKUP;
+						if ((access & GL_MAP_FLUSH_EXPLICIT_BIT) == 0)
+						{
+							psBufObject->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_FLUSH_BY_UNMAP;
+						}
+					}
+					else if ((access & GL_MAP_FLUSH_EXPLICIT_BIT) != 0)
+					{
+						/* The content of the backup data store will be copied to original buffer data store
+						   when calling glFlushMappedBufferRange to flush the specified range.
+
+						   The backup data store should have the original buffer data store content as the
+						   flushed range may not be filled by client and the value in that range copied
+						   back should still be corrected in order not to corrupt the original buffer data
+						   store.
+						 */
+
+						CopyBetweenBufferDataStores(gc, psBufObject->psBackupMemInfo,  psBufObject->pvBackupCpuVirtAddr, 0,
+														psBufObject->psMemInfo, psBufObject->pvCpuVirtAddr, offset, length);
+
+						psBufObject->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_FLUSH_BY_CLIENT;
+					}
+				}
+			}
+
+			if (pvBuffer == NULL)
+			{
+				IMG_BOOL bDataStoreReallocated;
+
+				/* Fall back to normal method using wait until valid.
+
+				   If the content of the buffer data store is filled by GL, we need to wait for
+				   content valid before client writing data to it.  Otherwise, the content may
+				   still be changed by GL later before using the client written content.
+				 */
+				if ((!WaitForBufferObjectContentValid(gc, psBufObject)) ||
+					(!WaitForBufferObjectValidForChange(gc, psBufObject, GLES3_CPU_BLOCK_ON_DATASTORE, &bDataStoreReallocated)))
+				{
+					PVR_DPF((PVR_DBG_ERROR,"MapBufferRange: Buffer cannot be mapped"));
+					SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+								      "glMapBufferRange: either buffer contents not valid yet, or buffer"
+								      " data cannot be altered since it is still in use elsewhere",
+								      psBufObject->sNamedItem.pszLabel);
+					return NULL;
+				}
+				else
+				{
+					/* Process buffer data store changed */
+					ProcessBufferDataStoreChange(gc, psBufObject, bDataStoreReallocated, IMG_TRUE);
+				}
+
+				pvBuffer = (void *)((IMG_UINT8 *)psBufObject->pvCpuVirtAddr + offset);
+			}
+		}
+	}
+
+	/* save all the settings */
+	psBufObject->ui32AccessFlags = access;
+
+	if (((access & GL_MAP_WRITE_BIT) != 0) && ((access & GL_MAP_READ_BIT) == 0))
+	{
+		psBufObject->eAccess = GL_WRITE_ONLY_OES;
+	}
+
+	psBufObject->ui32BufferMapOffset = (IMG_UINT32)offset;
+	psBufObject->ui32BufferMapLength = (IMG_UINT32)length;
+	psBufObject->bMapped = IMG_TRUE;
+	psBufObject->bMappedNonPersistent = (access & GL_MAP_PERSISTENT_BIT_EXT) ? IMG_FALSE : IMG_TRUE;
+	psBufObject->pvBufferMapPointer = pvBuffer;
+
+#if defined(DEBUG)
+	if(gc->sAppHints.uDumpAllResults && (access & GL_MAP_READ_BIT))
+	{
+		WaitForBufferObjectContentValid(gc, psBufObject);
+		PDumpLiveResultBufObj(gc, psBufObject->psMemInfo->hMemDesc, (IMG_UINT32)offset, (IMG_UINT32)length, "map_read");
+	}
+#endif
+
+	return pvBuffer;
+}
+
+/***********************************************************************************
+ Function Name      : FlushSpecifiedBufferRange
+ Inputs             : gc, i32TargetIndex, psBufObject, ui32Offset, ui32Length
+ Outputs            : -
+ Returns            : void
+ Description        : Flush a specified buffer range
+************************************************************************************/
+GLES_STATIC void FlushSpecifiedBufferRange(GLES3Context * gc,
+									  GLES3BufferObject *psBufObject,
+									  IMG_UINT32 ui32Offset, IMG_UINT32 ui32Length, IMG_BOOL bImplicitFlush)
+{
+    IMG_UINT32 ui32CopyLength = ui32Length;
+
+    if(!ui32Length) return;
+
+#if defined(RGX_FEATURE_TLA) || (defined(RGX_FEATURE_FASTRENDER_DM) && !defined(RGX_TDM_OVERLAP_WITH_3D_DISABLED))
+    if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+    {
+        if (bImplicitFlush)
+        {
+            /* Release the CPU mapping in case TQCopyBetweenBufferDataStores will add the backup buffer
+               to free queue.
+             */
+            PVRSRVReleaseCPUMapping(psBufObject->psBackupMemInfo->hMemDesc);
+            psBufObject->pvBackupCpuVirtAddr = NULL;
+        }
+
+        ui32CopyLength = TQCopyBetweenBufferDataStores(gc,
+            psBufObject, &psBufObject->sRMResource, psBufObject->psMemInfo, psBufObject->ui32BufferMapOffset + ui32Offset,
+            NULL, &psBufObject->sRMBackupResource, psBufObject->psBackupMemInfo, ui32Offset,
+            ui32Length, bImplicitFlush ? psBufObject->psBackupMemInfo : NULL);
+
+        if (ui32CopyLength < ui32Length)
+        {
+            psBufObject->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_BACKUP_USED_IN_TQ;
+        }
+
+        if ((ui32CopyLength==0) && bImplicitFlush)
+        {
+        	/*  We allowed TQCopyBetweenBufferDataStores to free this if nothing remains, and nothing remains to be copied.
+        	 * Mark the devmem as forgettable, as TQM will manage its devmemFree(). */
+        	psBufObject->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_BACKUP_AUTO_RECYCLED;
+        }
+    }
+#else
+	PVR_UNREFERENCED_PARAMETER(bImplicitFlush);
+#endif
+
+    if (ui32CopyLength > 0)
+    {
+    	ui32Offset += (ui32Length - ui32CopyLength);
+
+#if defined(RGX_FEATURE_TLA) || (defined(RGX_FEATURE_FASTRENDER_DM) && !defined(RGX_TDM_OVERLAP_WITH_3D_DISABLED))
+        if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+        {
+            if (bImplicitFlush)
+            {
+                PVRSRVAcquireCPUMapping(psBufObject->psBackupMemInfo->hMemDesc, &psBufObject->pvBackupCpuVirtAddr);
+            }
+
+#if defined(DEBUG)
+            PVR_DPF((PVR_DBG_WARNING, "FlushSpecifiedBufferRange: %d out of %d is copied through CPU.  This is slow but NOT an error.", ui32CopyLength, ui32Length));
+#endif
+        }
+#endif
+
+        /* Do flush based on the source of the modification data
+
+	       If the content of the buffer data store is filled by GL, we need to wait for
+	       content valid before doing the flush.  Otherwise, the content may still be
+	       changed by GL later before using the flushed content.
+	     */
+	    if ((!WaitForBufferObjectContentValid(gc, psBufObject)) ||
+		    (!WaitForBufferObjectValidForChange(gc, psBufObject, GLES3_CPU_BLOCK_ON_DATASTORE, NULL)))
+	    {
+		    PVR_DPF((PVR_DBG_ERROR,"FlushSpecifiedBufferRange: Buffer didn't become free"));
+		    SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+					          "while flushing specific buffer range, either buffer contents not valid yet,"
+					          " or buffer data cannot be altered since it is still in use elsewhere",
+					          psBufObject->sNamedItem.pszLabel);
+		    return;
+	    }
+
+	    /* The content in the backup data store is valid right after client's writing
+	       as it is combined-uncached map.  Thus, copying the content from backup data
+	       store to original data store is a valid operation.
+	     */
+
+	    CopyBetweenBufferDataStores(gc, psBufObject->psMemInfo, psBufObject->pvCpuVirtAddr, psBufObject->ui32BufferMapOffset + ui32Offset,
+								    psBufObject->psBackupMemInfo, psBufObject->pvBackupCpuVirtAddr, ui32Offset, ui32CopyLength);
+    }
+}
+
+/***********************************************************************************
+ Function Name      : UnmapBuffer
+ Inputs             : gc, i32TargetIndex
+ Outputs            : -
+ Returns            : IMG_BOOL
+ Description        : Unmap the mapped buffer(range)
+************************************************************************************/
+GLES_STATIC IMG_BOOL UnmapBuffer(GLES3Context * gc, IMG_INT32 i32TargetIndex)
+{
+	GLES3BufferObject **ppsBufBindingPoint;
+	GLES3BufferObject *psBufObject;
+
+	/* Check the target index */
+	if (i32TargetIndex == -1)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    "glUnmapBuffer: target is not one of the accepted buffer targets");
+		return IMG_FALSE;
+	}
+
+	/* Get general buffer binding point */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+
+	/* Get the bound buffer object and check its availability */
+	if ((ppsBufBindingPoint == NULL) || (psBufObject = *ppsBufBindingPoint) == NULL)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glUnmapBuffer: reserved buffer object name 0 is bound to target");
+		return IMG_FALSE;
+	}
+
+	/* Check whether the buffer is mapped */
+	if (!psBufObject->bMapped)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glUnmapBuffer: buffer bound to target is not mapped",
+					      psBufObject->sNamedItem.pszLabel);
+		return IMG_FALSE;
+	}
+
+	/* Check whether any data exists in the buffer */
+	if (!psBufObject->pvCpuVirtAddr)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glUnmapBuffer: no data exists in this buffer",
+					      psBufObject->sNamedItem.pszLabel);
+		return IMG_FALSE;
+	}
+
+	/* Flush the data if necessary */
+	if ((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_FLUSH_BY_UNMAP) != 0)
+	{
+		if ((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_USE_BACKUP) != 0)
+		{
+			/* Use backup during unmap flush only needs to wait for buffer object
+			   to be valid for change and then free the old buffer data store if
+			   necessary and use the backup buffer data store instead.
+			 */
+            IMG_UINT32 ui32BufferSize = psBufObject->ui32BufferSize;
+
+			if (!WaitForBufferObjectValidForChange(gc, psBufObject, 0, NULL))
+			{
+				PVR_DPF((PVR_DBG_ERROR,"UnmapBuffer: Buffer didn't become free"));
+				SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+							      "glUnmapBuffer: buffer data cannot be altered since it is"
+							      " still in use elsewhere",
+							      psBufObject->sNamedItem.pszLabel);
+				return IMG_FALSE;
+			}
+
+			if (psBufObject->psMemInfo != NULL)
+			{
+				PVRSRVReleaseCPUMapping(psBufObject->psMemInfo->hMemDesc);
+				psBufObject->pvCpuVirtAddr = NULL;
+
+				RMLog(gc->psSysContext->psRM, RM_LL_RESOURCE, RM_LOG_RESOURCEF " FREE BufferObject meminfo "IMG_DEV_VIRTADDR_FMTSPEC" size "IMG_DEV_VIRTADDR_FMTSPEC"\n",
+						RM_LOG_RESOURCE((&psBufObject->sRMResource)),
+						psBufObject->psMemInfo->sDevVirtAddr.uiAddr, psBufObject->psMemInfo->uiAllocationSize);
+
+				GLES3FREEDEVICEMEM(psBufObject->psMemInfo);
+			}
+
+			/* Use the backup buffer data store */
+			psBufObject->psMemInfo = psBufObject->psBackupMemInfo;
+			psBufObject->pvCpuVirtAddr = psBufObject->pvBackupCpuVirtAddr;
+            psBufObject->ui32BufferSize = ui32BufferSize;
+
+            FlushCachedDevmem(psBufObject->psMemInfo, GL_MAP_WRITE_BIT);
+
+			/* Process buffer data store change */
+			ProcessBufferDataStoreChange(gc, psBufObject, IMG_TRUE, IMG_TRUE);
+
+			psBufObject->psBackupMemInfo = NULL;
+			psBufObject->pvBackupCpuVirtAddr = NULL;
+		}
+		else if ((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_COPY_BACKUP) != 0)
+		{
+			/* We need to copy backup */
+            FlushSpecifiedBufferRange(gc, psBufObject, 0, psBufObject->ui32BufferMapLength, IMG_TRUE);
+
+			/* Process buffer data store change */
+			ProcessBufferDataStoreChange(gc, psBufObject, IMG_FALSE, IMG_TRUE);
+		}
+	}
+	else if ((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_FLUSHED_BY_CLIENT) != 0)
+	{
+		/* Process buffer data store change */
+		ProcessBufferDataStoreChange(gc, psBufObject, IMG_FALSE, IMG_TRUE);
+	}
+	else
+	{
+		if(psBufObject->ui32AccessFlags & GL_MAP_WRITE_BIT)
+		{
+			if(!psBufObject->psBackupMemInfo)
+			{
+				FlushCachedDevmemRange(psBufObject->psMemInfo, psBufObject->ui32BufferMapOffset, psBufObject->ui32BufferMapLength, GL_MAP_WRITE_BIT);
+			}
+			else
+			{
+				FlushCachedDevmem(psBufObject->psBackupMemInfo, GL_MAP_WRITE_BIT);
+			}
+		}
+	}
+
+	if(psBufObject->psBackupMemInfo)
+	{
+		if(psBufObject->pvBackupCpuVirtAddr)
+		{
+			/* Just before we forget about this devmem by freeing it below or having TQM free it,
+			 * unmap the buffer */
+			PVRSRVReleaseCPUMapping(psBufObject->psBackupMemInfo->hMemDesc);
+			psBufObject->pvBackupCpuVirtAddr = NULL;
+		}
+
+		/* Free the backup data store if necessary */
+		if ((psBufObject->psBackupMemInfo != NULL) &&
+			((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_BACKUP_AUTO_RECYCLED) == 0))
+		{
+			if ((psBufObject->ui32MapOPFlag & GLES3_MAP_BUFOBJ_BACKUP_USED_IN_TQ) != 0)
+			{
+				RM_WaitUntilResourceIsNotNeededByHWQueue(gc->psSysContext->psRM, &psBufObject->sRMBackupResource, gc->psSysContext->psHWQueue_TQ, GLES3_DEFAULT_WAIT_RETRIES);
+			}
+			RMLog(gc->psSysContext->psRM, RM_LL_RESOURCE, RM_LOG_RESOURCEF " FREE BackupBufferObject meminfo "IMG_DEV_VIRTADDR_FMTSPEC" size "IMG_DEV_VIRTADDR_FMTSPEC"\n",
+					RM_LOG_RESOURCE((&psBufObject->sRMBackupResource)),
+					psBufObject->psBackupMemInfo->sDevVirtAddr.uiAddr, psBufObject->psBackupMemInfo->uiAllocationSize);
+			GLES3FREEDEVICEMEM(psBufObject->psBackupMemInfo);
+		}
+
+		/* Forget about this devmem,  we either freed it above, or TQM will free it */
+		psBufObject->psBackupMemInfo = NULL;
+	}
+
+
+#if defined(PDUMP)
+    if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+    {
+        psBufObject->bDumped = IMG_FALSE;
+    }
+    else
+    {
+        PDumpBufferObjectDataStore(gc, psBufObject, IMG_TRUE);
+    }
+#endif
+
+	/* Reset all the map states */
+	psBufObject->pvBufferMapPointer = NULL;
+	psBufObject->ui32BufferMapOffset = 0;
+	psBufObject->ui32BufferMapLength = 0;
+	psBufObject->ui32AccessFlags = 0;
+	psBufObject->ui32MapOPFlag = 0;
+	psBufObject->bMapped = IMG_FALSE;
+	psBufObject->bMappedNonPersistent = IMG_FALSE;
+
+	return IMG_TRUE;
+}
+
+/***********************************************************************************
+ Function Name      : glMapBufferRange
+ Inputs             : target, offset, length, access
+ Outputs            : -
+ Returns            : GLvoid*
+ Description        : ENTRYPOINT: Map a range of the bound buffer object for
+                      client access
+************************************************************************************/
+GL_APICALL GLvoid* GL_APIENTRY glMapBufferRange (GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access)
+{
+	GLvoid * pvBuffer;
+
+	__GLES3_GET_CONTEXT_RETURN(NULL);
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glMapBufferRange"));
+
+	GLES3_TIME_START(GLES3_TIMES_glMapBufferRange);
+
+	pvBuffer = (GLvoid *)MapBufferRange(gc, GetBufferIndexFromTarget(target), access, IMG_TRUE, offset, length);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glMapBufferRange);
+
+	return pvBuffer;
+}
+
+/***********************************************************************************
+ Function Name      : glFlushMappedBufferRange
+ Inputs             : target, offset, length
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Flush modification to the specified range of the
+                      mapped buffer range.
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glFlushMappedBufferRange (GLenum target, GLintptr offset, GLsizeiptr length)
+{
+	IMG_INT32 i32TargetIndex;
+	GLES3BufferObject **ppsBufBindingPoint;
+	GLES3BufferObject *psBufObj;
+
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glFlushMappedBufferRange"));
+
+	GLES3_TIME_START(GLES3_TIMES_glFlushMappedBufferRange);
+
+	i32TargetIndex = GetBufferIndexFromTarget(target);
+	/* Check the target index */
+	if (i32TargetIndex == -1)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    "glFlushMappedBufferRange: target is not one of the accepted buffer targets");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glFlushMappedBufferRange);
+		return;
+	}
+
+	/* Get general buffer binding point */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32TargetIndex);
+	/* Get the bound buffer object and check its availability */
+	if ((ppsBufBindingPoint == NULL) || ((psBufObj = *ppsBufBindingPoint) == NULL))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glFlushMappedBufferRange: reserved buffer object name 0 is bound to target");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glFlushMappedBufferRange);
+		return;
+	}
+
+	/* Check if buffer is mapped and the FLUSH_EXPLICIT_BIT is set */
+	if ((!psBufObj->bMapped) || ((psBufObj->ui32AccessFlags & GL_MAP_FLUSH_EXPLICIT_BIT) == 0))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glFlushMappedBufferRange: buffer bound to target is not mapped, or is"
+					      " mapped without the GL_MAP_FLUSH_EXPLICIT flag",
+					      psBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glFlushMappedBufferRange);
+		return;
+	}
+
+	/* Check the range to be flushed */
+	if ((offset < 0) || (length < 0) || ((IMG_UINT32)(offset + length) > psBufObj->ui32BufferMapLength))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					      "glFlushMappedBufferRange: offset or length is negative or (offset + length)"
+					      " exceeds the size of the mapping",
+					      psBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glFlushMappedBufferRange);
+		return;
+	}
+
+	if (((psBufObj->ui32MapOPFlag & GLES3_MAP_BUFOBJ_USE_BACKUP) != 0) ||
+		((psBufObj->ui32MapOPFlag & GLES3_MAP_BUFOBJ_COPY_BACKUP) != 0))
+	{
+		/* MAP_BUFOBJ_USE_BACKUP or MAP_BUFOBJ_COPY_BACKUP indicates to
+		   use Unmap to do the flush
+		 */
+		psBufObj->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_FLUSH_BY_UNMAP;
+	}
+	else
+	{
+		/* Flush the specified range if the flush needs to be done by client */
+		if ((psBufObj->ui32MapOPFlag & GLES3_MAP_BUFOBJ_FLUSH_BY_CLIENT) != 0)
+		{
+			FlushSpecifiedBufferRange(gc, psBufObj, (IMG_UINT32)offset, (IMG_UINT32)length, IMG_FALSE);
+
+			/* Set the flag to process buffer data store change in Unmap.
+
+			   By use this flag, the processing of buffer data store change only happen ones
+			   in Unmap.  The processing can be moved here but will be executed every time
+			   this API called by the client
+			 */
+			psBufObj->ui32MapOPFlag |= GLES3_MAP_BUFOBJ_FLUSHED_BY_CLIENT;
+		}
+	}
+
+	GLES3_TIME_STOP(GLES3_TIMES_glFlushMappedBufferRange);
+}
+
+/***********************************************************************************
+ Function Name      : glUnmapBuffer
+ Inputs             : target
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Unmap a mapped buffer object
+************************************************************************************/
+GL_APICALL GLboolean GL_APIENTRY glUnmapBuffer (GLenum target)
+{
+	GLboolean bRet;
+
+	__GLES3_GET_CONTEXT_RETURN(GL_FALSE);
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glUnmapBuffer"));
+
+	GLES3_TIME_START(GLES3_TIMES_glUnmapBuffer);
+
+	bRet = (GLboolean)UnmapBuffer(gc, GetBufferIndexFromTarget(target));
+
+	GLES3_TIME_STOP(GLES3_TIMES_glUnmapBuffer);
+
+	return bRet;
+}
+
+/***********************************************************************************
+ Function Name      : glMapBuffer
+ Inputs             : target, access
+ Outputs            : -
+ Returns            :
+ Description        :
+************************************************************************************/
+/* PRQA S 3334 1 */ /* access is the required name for this function. */
+GL_API_EXT void * GL_APIENTRY glMapBufferOES(GLenum target, GLenum access)
+{
+	GLbitfield accessFlags;
+	void *pvBuffer;
+
+	__GLES3_GET_CONTEXT_RETURN(NULL);
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glMapBuffer"));
+
+	GLES3_TIME_START(GLES3_TIMES_glMapBuffer);
+
+	switch(access)
+	{
+		case GL_WRITE_ONLY_OES:
+		{
+			accessFlags = GL_MAP_WRITE_BIT;
+			break;
+		}
+		default:
+		{
+			SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+					    "glMapBufferOES: access is something other than GL_WRITE_ONLY_OES");
+
+			GLES3_TIME_STOP(GLES3_TIMES_glMapBuffer);
+			return NULL;
+		}
+	}
+
+	pvBuffer = (void *)MapBufferRange(gc, GetBufferIndexFromTarget(target), accessFlags, IMG_FALSE, 0, 0);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glMapBuffer);
+
+	return pvBuffer;
+}
+
+/***********************************************************************************
+ Function Name      : glCopyBufferSubData
+ Inputs             : readTarget, writeTarget, readOffset, writeOffset, size
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Copy data store between two buffers
+************************************************************************************/
+GL_APICALL void GL_APIENTRY glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size)
+{
+	IMG_INT32 i32ReadTargetIndex, i32WriteTargetIndex;
+	GLES3BufferObject **ppsBufBindingPoint;
+	GLES3BufferObject *psReadBufObj, *psWriteBufObj;
+	IMG_BOOL bDataStoreReallocated;
+    IMG_UINT32 ui32CopySize;
+    IMG_UINT32 ui32JobRef;
+
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glCopyBufferSubData"));
+
+	GLES3_TIME_START(GLES3_TIMES_glCopyBufferSubData);
+
+	i32ReadTargetIndex = GetBufferIndexFromTarget(readTarget);
+	i32WriteTargetIndex = GetBufferIndexFromTarget(writeTarget);
+
+	/* Check the target index */
+	if ((i32ReadTargetIndex == -1) || (i32WriteTargetIndex == -1))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID,
+				    "glCopyBufferSubData: the readtarget or the writetarget is not one of the accepted buffer targets");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	/* Get buffer objects bound to these two general binding points.
+	   Check if 0 is bound to these binding points and check if the
+	   bound buffer (if valid) is mapped
+	 */
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32ReadTargetIndex);
+	if ((ppsBufBindingPoint == NULL) ||
+		((psReadBufObj = *ppsBufBindingPoint) == NULL))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glCopyBufferSubData: reserved buffer object name 0 is bound to readtarget");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	if (psReadBufObj->bMappedNonPersistent)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glCopyBufferSubData: buffer object bound to the readtarget is mapped",
+					      psReadBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	ppsBufBindingPoint = GetGeneralBindingPoint(gc, i32WriteTargetIndex);
+	if ((ppsBufBindingPoint == NULL) ||
+		((psWriteBufObj = *ppsBufBindingPoint) == NULL))
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+				    "glCopyBufferSubData: reserved buffer object name 0 is bound to writetarget");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	if (psWriteBufObj->bMappedNonPersistent)
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID,
+					      "glCopyBufferSubData: buffer object bound to the writetarget is mapped",
+					      psWriteBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	/* Check whether size is negative */
+	if (size < 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+				    "glCopyBufferSubData: size is negative, which is an invalid value");
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	/* Check the readOffset */
+	if ((readOffset < 0) ||
+		((IMG_UINT32)(readOffset + size) > psReadBufObj->ui32BufferSize))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					      "glCopyBufferSubData: readoffset is negative, or (readoffset + size) exceeds"
+					      " the size of the buffer object bound to the readtarget",
+					      psReadBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	/* Check the writeOffset */
+	if ((writeOffset < 0) ||
+		((IMG_UINT32)(writeOffset + size) > psWriteBufObj->ui32BufferSize))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					      "glCopyBufferSubData: writeoffset is negative, or (writeoffset + size) exceeds"
+					      " the size of the buffer object bound to the writetarget",
+					      psWriteBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	/* Check the range overlap if two buffers are same */
+	if ((psReadBufObj == psWriteBufObj) &&
+		((writeOffset + size > readOffset) && (writeOffset < readOffset + size)))
+	{
+		SetErrorWithMessageForObjects(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID,
+					      "glCopyBufferSubData: the same buffer object is bound to both readtarget"
+					      " and writetarget and the ranges [readoffset, readoffset + size) and "
+					      "[writeoffset, writeoffset + size) overlap",
+					      psReadBufObj->sNamedItem.pszLabel);
+
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	if (size == 0)
+	{
+		GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+		return;
+	}
+
+	ui32JobRef = gc->psRenderSurface?gc->psRenderSurface->sGlesKick.ui32JobRef:gc->ui32CurrentTAJobRef;
+	HWPerfClientFuncStart(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_COPYBUFFERSUBDATA, ui32JobRef, gc->ui32ContextID, "glCopyBufferSubData");
+
+    ui32CopySize = size;
+
+    if (gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ)
+    {
+        ui32CopySize = TQCopyBetweenBufferDataStores(gc,
+            psWriteBufObj, &psWriteBufObj->sRMResource, psWriteBufObj->psMemInfo, writeOffset,
+            psReadBufObj, &psReadBufObj->sRMResource, psReadBufObj->psMemInfo, readOffset,
+            size, NULL);
+    }
+
+    if (ui32CopySize > 0)
+    {
+#if defined(DEBUG)
+        if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) != 0)
+        {
+            PVR_DPF((PVR_DBG_WARNING, "glCopyBufferSubData: %d out of %d is copied through CPU.  This is slow but NOT an error.", ui32CopySize, (IMG_UINT32)size));
+        }
+#endif
+
+	    /* Wait until read buffer content valid */
+	    if (!WaitForBufferObjectContentValid(gc, psReadBufObj))
+	    {
+		    PVR_DPF((PVR_DBG_ERROR,"glCopyBufferSubData: Buffer didn't become free"));
+		    SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+					          "glCopyBufferSubData: buffer contents of the buffer"
+					          " object bound to the readtarget not valid yet",
+					          psReadBufObj->sNamedItem.pszLabel);
+
+		    GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+			HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_COPYBUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+		    return;
+	    }
+
+	    /* wait until the data store of the write buffer is free for change */
+	    if (!WaitForBufferObjectValidForChange(gc, psWriteBufObj, GLES3_CPU_BLOCK_ON_DATASTORE, &bDataStoreReallocated))
+	    {
+		    PVR_DPF((PVR_DBG_ERROR,"glCopyBufferSubData: Buffer didn't become free"));
+		    SetErrorWithMessageForObjects(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID,
+					          "glCopyBufferSubData: buffer data of the buffer object bound to the "
+					          "writetarget, cannot be altered since it is still in use elsewhere",
+					          psWriteBufObj->sNamedItem.pszLabel);
+
+		    GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+			HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_COPYBUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+		    return;
+	    }
+
+	    CopyBetweenBufferDataStores(gc, psWriteBufObj->psMemInfo, psWriteBufObj->pvCpuVirtAddr, writeOffset + (size - ui32CopySize),
+	    								psReadBufObj->psMemInfo, psReadBufObj->pvCpuVirtAddr, readOffset + (size - ui32CopySize), ui32CopySize);
+
+    	RM_NotifyCPUOperation(gc->psSysContext->psRM, &psReadBufObj->sRMResource, RM_USAGE_READ);
+    	RM_NotifyCPUOperation(gc->psSysContext->psRM, &psWriteBufObj->sRMResource, RM_USAGE_WRITE);
+
+#if defined(PDUMP)
+        if ((gc->sAppHints.ui32TQEnables & GLES3_TQ_ENABLE_COPYBUFOBJ) == 0)
+        {
+            psWriteBufObj->bDumped = IMG_FALSE;
+        }
+        else
+        {
+            psWriteBufObj->bRequirePDumpPol = IMG_TRUE;
+        }
+#endif
+
+        /* Process buffer data store change */
+	    ProcessBufferDataStoreChange(gc, psWriteBufObj, bDataStoreReallocated, IMG_TRUE);
+    }
+
+	GLES3_TIME_STOP(GLES3_TIMES_glCopyBufferSubData);
+	HWPerfClientFuncEnd(gc->psSysContext->psDevConnection, RGX_HWPERF_OGLES_MARK_ID_COPYBUFFERSUBDATA, ui32JobRef, gc->ui32ContextID);
+}
+
+/***********************************************************************************
+ Function Name      : GetIndexedBufferBindingSize
+ Inputs             : psIndexedBindingPoint
+ Outputs            : -
+ Returns            : -
+ Description        : Get binding size for indexed buffer binding point.
+************************************************************************************/
+IMG_INTERNAL IMG_UINT32 GetIndexedBufferBindingSize(GLES3BufferObjectIndexedBindingPoint *psIndexedBindingPoint)
+{
+    IMG_UINT32 ui32BufferSize;
+	GLES_ASSERT((psIndexedBindingPoint != NULL) && (psIndexedBindingPoint->psBufferObject != NULL));
+
+    ui32BufferSize = psIndexedBindingPoint->psBufferObject->ui32BufferSize;
+
+    if (psIndexedBindingPoint->bSizeSet)
+    {
+        IMG_UINT32 ui32BindingSize = psIndexedBindingPoint->ui32Size;
+
+        if (psIndexedBindingPoint->bOffsetSet)
+        {
+            if (ui32BindingSize + psIndexedBindingPoint->ui32Offset > ui32BufferSize)
+            {
+                ui32BindingSize = ui32BufferSize - psIndexedBindingPoint->ui32Offset;
+            }
+        }
+        else
+        {
+            if (ui32BindingSize > ui32BufferSize)
+            {
+                ui32BindingSize = ui32BufferSize;
+            }
+        }
+
+        return ui32BindingSize;
+    }
+    else
+    {
+        if (psIndexedBindingPoint->bOffsetSet)
+        {
+            return ui32BufferSize - psIndexedBindingPoint->ui32Offset;
+        }
+        else
+        {
+            return ui32BufferSize;
+        }
+    }
+}
+
+#if defined(GLES31_EXTENSION_BUFFER_STORAGE)
+/***********************************************************************************
+ Function Name      : glBufferStorageEXT
+ Inputs             : target, size, data, flags
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Create immutable buffer storage object
+************************************************************************************/
+GL_API_EXT void GL_APIENTRY glBufferStorageEXT(GLenum target, GLsizeiptr size, const void * data, GLbitfield flags)
+{
+	__GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE,"glBufferStorageEXT"));
+	GLES3_TIME_START(GLES3_TIMES_glBufferStorageEXT);
+
+	BufferStorage(gc, target, size, data, flags, GL_DYNAMIC_DRAW, IMG_TRUE, NULL, 0, NULL);
+
+	GLES3_TIME_STOP(GLES3_TIMES_glBufferStorageEXT);
+}
+#endif /* GLES31_EXTENSION_BUFFER_STORAGE */
+
+#if defined(GLES31_EXTENSION_BUFFER_EXTERNAL)
+/***********************************************************************************
+ Function Name      : glBufferStorageExternalEXT
+ Inputs             : target, offset, size, client-provided buffer, flags
+ Outputs            : -
+ Returns            : -
+ Description        : ENTRYPOINT: Create immutable buffer storage object by sourcing
+                                  the data from an external, application-managed buffer.
+************************************************************************************/
+GL_API_EXT void GL_APIENTRY glBufferStorageExternalEXT(GLenum target, GLintptr offset, GLsizeiptr size, GLeglClientBufferEXT clientBuffer, GLbitfield flags)
+{
+    __GLES3_GET_CONTEXT();
+
+	PVR_DPF((PVR_DBG_CALLTRACE, "glBufferStorageExternalEXT"));
+    GLES3_TIME_START(GLES3_TIMES_glBufferStorageExternalEXT);
+
+	IMGEGLBuffer sEGLBuffer;
+	const IMG_INT32 i32TargetIndex = GetBufferIndexFromTarget(target);
+	const GLES3BufferObject *psBufObject = *GetGeneralBindingPoint(gc, i32TargetIndex);
+
+	if(i32TargetIndex == 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: 0 cannot be bound to target.");
+		goto StopTimerAndReturn;
+	}
+
+	if(psBufObject && psBufObject->bImmutable)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_OPERATION, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: buffer bound to target cannot be immutable.");
+		goto StopTimerAndReturn;
+	}
+
+	if(offset != 0)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: offset must be 0.");
+		goto StopTimerAndReturn;
+	}
+
+	switch(target)
+	{
+		case GL_ARRAY_BUFFER:
+		case GL_ATOMIC_COUNTER_BUFFER:
+		case GL_COPY_READ_BUFFER:
+		case GL_COPY_WRITE_BUFFER:
+		case GL_DISPATCH_INDIRECT_BUFFER:
+		case GL_DRAW_INDIRECT_BUFFER:
+		case GL_ELEMENT_ARRAY_BUFFER:
+		case GL_PIXEL_PACK_BUFFER:
+		case GL_PIXEL_UNPACK_BUFFER:
+		case GL_SHADER_STORAGE_BUFFER:
+		case GL_TEXTURE_BUFFER:
+		case GL_TRANSFORM_FEEDBACK_BUFFER:
+		case GL_UNIFORM_BUFFER:
+		{
+			break;
+		}
+		default:
+		{
+			SetErrorWithMessage(gc, GL_INVALID_ENUM, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: target is not an accepted value.");
+			goto StopTimerAndReturn;
+		}
+	}
+
+	if(KEGLGetBufferSource(gc->psSysContext, clientBuffer, &sEGLBuffer) != IMG_EGL_NO_ERROR)
+	{
+		SetErrorWithMessage(gc, GL_OUT_OF_MEMORY, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: KEGLGetBufferSource() returned an error..");
+		goto StopTimerAndReturn;
+	}
+
+	if((offset+size) > (GLsizeiptr)sEGLBuffer.ui32Size)
+	{
+		SetErrorWithMessage(gc, GL_INVALID_VALUE, GLES3_DM_GL_ID, "glBufferStorageExternalEXT: (offset+size) cannot exceed buffer size.");
+		goto StopTimerAndReturn;
+	}
+
+	BufferStorage(gc, target, size, NULL, flags, GL_DYNAMIC_DRAW, IMG_TRUE, NULL, 0, (EGLClientBuffer*)&sEGLBuffer);
+
+StopTimerAndReturn:
+    GLES3_TIME_STOP(GLES3_TIMES_glBufferStorageExternalEXT);
+}
+#endif /* #if defined(GLES31_EXTENSION_EXTERNAL_BUFFER) */
+
+/******************************************************************************
+ End of file (bufobj.c)
+******************************************************************************/
